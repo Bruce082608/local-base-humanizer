@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Base-Model Humanizer Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">H</div>
+        <div>
+          <h1 class="brand-title">Local Base-Model Humanizer</h1>
+          <p class="brand-sub" data-i18n="subtitle">Ollama 基础模型逐词元反贪心降 AI 率工作台</p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div id="ollamaStatus" class="status-pill status-checking" title="Ollama Connection">
+          <span class="status-dot"></span>
+          <span class="status-text" data-i18n="ollamaChecking">检测 Ollama...</span>
+        </div>
+        <button id="btnRefreshModels" class="btn btn-ghost btn-sm" title="Refresh Ollama models">↻</button>
+        <button id="btnLang" class="btn btn-ghost btn-sm">EN</button>
+        <button id="btnTheme" class="btn btn-ghost btn-sm" title="Toggle Theme">☀</button>
+        <a class="btn btn-outline btn-sm" href="https://www.zerogpt.com/" target="_blank" rel="noopener">
+          <span data-i18n="openZeroGpt">打开 ZeroGPT ↗</span>
+        </a>
+      </div>
+    </header>
+
+    <!-- Main 3-Column Studio Grid -->
+    <main class="workspace">
+      <!-- Left Sidebar: Controls -->
+      <aside class="sidebar">
+        <section class="panel">
+          <div class="panel-header">
+            <h2 data-i18n="modelConfig">模型与连接</h2>
+          </div>
+
+          <div class="field">
+            <label for="ollamaUrl" data-i18n="ollamaUrl">Ollama 地址</label>
+            <input id="ollamaUrl" type="text" value="http://127.0.0.1:11434" spellcheck="false" />
+          </div>
+
+          <div class="field">
+            <label for="modelSelect">
+              <span data-i18n="baseModel">本地模型（推荐 Base 未对齐模型）</span>
+            </label>
+            <select id="modelSelect">
+              <option value="lab-qwen3-4b-base:latest">lab-qwen3-4b-base:latest</option>
+            </select>
+            <p class="hint" data-i18n="baseHint">带 base 标识的预训练模型抗检测效果最佳。</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2 data-i18n="decodingParams">反贪心解码参数</h2>
+            <button id="btnResetParams" class="btn-link" data-i18n="reset">重置</button>
+          </div>
+
+          <div class="field">
+            <div class="field-row">
+              <label for="pSkip" data-i18n="pSkipLabel">Top-1 跳过率 (p_skip)</label>
+              <span id="pSkipVal" class="mono-val">0.72</span>
+            </div>
+            <input id="pSkip" type="range" min="0" max="0.95" step="0.02" value="0.72" />
+            <p class="hint" data-i18n="pSkipHint">越高越偏离大模型高频路径，建议 0.65–0.78</p>
+          </div>
+
+          <div class="field">
+            <div class="field-row">
+              <label for="minPpl" data-i18n="minPplLabel">目标最低困惑度 (Min PPL)</label>
+              <span id="minPplVal" class="mono-val">3.8</span>
+            </div>
+            <input id="minPpl" type="range" min="1.5" max="8.0" step="0.1" value="3.8" />
+            <p class="hint" data-i18n="minPplHint">低于此值时自动更换随机种子重采样</p>
+          </div>
+
+          <div class="field-grid-2">
+            <div class="field">
+              <label for="attempts" data-i18n="attemptsLabel">单段最大重试</label>
+              <input id="attempts" type="number" min="1" max="8" value="3" />
+            </div>
+            <div class="field">
+              <label for="poolSize" data-i18n="poolLabel">候选词池 (2..K)</label>
+              <input id="poolSize" type="number" min="2" max="15" value="6" />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="seedInput" data-i18n="seedLabel">基础随机种子 (Seed)</label>
+            <div class="input-with-btn">
+              <input id="seedInput" type="number" value="401" />
+              <button id="btnRandSeed" class="btn btn-ghost btn-sm" title="Randomize seed">🎲</button>
+            </div>
+          </div>
+
+          <label class="checkbox-row">
+            <input id="useBootstrap" type="checkbox" checked />
+            <span data-i18n="bootstrapLabel">启用已锁定段落自举示范 (Self-Bootstrap)</span>
+          </label>
+        </section>
+
+        <section class="panel">
+          <details id="blacklistDetails">
+            <summary class="panel-header summary-header">
+              <h2 data-i18n="blacklistTitle">AI 高危词元黑名单</h2>
+              <span id="blacklistCount" class="badge">0</span>
+            </summary>
+            <div class="blacklist-body">
+              <textarea id="blacklistText" rows="5" spellcheck="false" placeholder="comma-separated substrings"></textarea>
+              <div class="blacklist-footer">
+                <span class="hint" data-i18n="blacklistHint">逗号分隔词根，解码时在 logprobs 层硬屏蔽</span>
+                <button id="btnResetBlacklist" class="btn-link" data-i18n="restoreDefault">恢复默认</button>
+              </div>
+            </div>
+          </details>
+        </section>
+      </aside>
+
+      <!-- Center: Source Input -->
+      <section class="editor-col">
+        <div class="col-header">
+          <div class="col-title-group">
+            <h2 data-i18n="sourceTitle">原文输入</h2>
+            <span id="inputStats" class="meta-pill">0 词 · 0 段</span>
+          </div>
+          <div class="col-actions">
+            <button id="btnLoadSample" class="btn btn-ghost btn-sm" data-i18n="loadSample">加载示例</button>
+            <button id="btnClearInput" class="btn btn-ghost btn-sm" data-i18n="clear">清空</button>
+          </div>
+        </div>
+
+        <textarea
+          id="sourceInput"
+          class="source-textarea"
+          spellcheck="false"
+          placeholder="在此粘贴英文学术/技术段落（支持多段文本、3.3.1 / # 标题以及 RQ1. 等行首小标题）..."
+        ></textarea>
+
+        <div class="run-bar">
+          <button id="btnRun" class="btn btn-primary">
+            <span class="btn-icon">▶</span>
+            <span data-i18n="runAll">开始改写</span>
+          </button>
+          <button id="btnStop" class="btn btn-danger hidden">
+            <span>■</span>
+            <span data-i18n="stop">停止</span>
+          </button>
+          <div id="runProgress" class="run-progress"></div>
+        </div>
+      </section>
+
+      <!-- Right: Output (Cards + Merged View) -->
+      <section class="output-col">
+        <div class="col-header">
+          <div class="col-title-group">
+            <h2 data-i18n="outputTitle">改写结果</h2>
+            <span id="outputStats" class="meta-pill">0 词 · 平均 PPL —</span>
+          </div>
+          <div class="col-actions">
+            <div class="segmented" role="tablist">
+              <button id="tabCards" class="seg-btn active" data-i18n="cardsView">分段落卡片</button>
+              <button id="tabMerged" class="seg-btn" data-i18n="mergedView">合并全文</button>
+            </div>
+            <button id="btnCopyAll" class="btn btn-outline btn-sm" data-i18n="copyAll">复制全文</button>
+            <button id="btnExport" class="btn btn-ghost btn-sm" data-i18n="exportTxt">导出 .txt</button>
+          </div>
+        </div>
+
+        <!-- Cards View -->
+        <div id="cardsContainer" class="cards-container">
+          <div class="empty-state">
+            <div class="empty-icon">✦</div>
+            <p class="empty-title" data-i18n="emptyTitle">准备就绪</p>
+            <p class="empty-desc" data-i18n="emptyDesc">
+              在左侧粘贴英文文本并点击「开始改写」。生成后你可以锁定已通过 ZeroGPT 检测的段落，并对仍被标黄的单个段落一键重新生成。
+            </p>
+          </div>
+        </div>
+
+        <!-- Merged View -->
+        <textarea id="mergedOutput" class="source-textarea hidden" readonly spellcheck="false"></textarea>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
