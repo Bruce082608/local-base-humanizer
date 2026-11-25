@@ -69,7 +69,7 @@ Liu et al. [3] built ultra-short-term wind-power prediction on a 5-node Hadoop c
 Paragraph:
 In the wind-power system that was built by Liu et al. [3], ultra-short-term prediction was run on a five-node Hadoop cluster with Intel Core i5 processors and Ubuntu. A combination of multivariate phase-space reconstruction and multivariate linear regression is used to combine past power measurements and selected weather variables. Five MapReduce jobs execute in parallel, with HDFS handling data distributed between the nodes. The system is tested on wind-farm data in the Chinese province of Hunan. Although there was a faster calculation time, there was no significant numerical speedup, and the target is to improve predictions of wind power generation instead of wind speed."""
 
-HEADING_RE = re.compile(r"^(?:#{1,6}\s+|\d+(?:\.\d+)*\s+[A-Z]).{0,100}$")
+HEADING_RE = re.compile(r"^(?:#{1,6}\s+.{1,100}|\d+(?:\.\d+)*\.?(?:\s+[A-Z].{0,100})?)$")
 WORD_START_RE = re.compile(r"^ [A-Za-z][A-Za-z'\-]*$")
 STOP_TOKENS = ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<think>", "</think>", "")
 
@@ -129,7 +129,12 @@ def parse_blocks(raw_text: str) -> List[Dict[str, str]]:
                 buf = []
             blocks.append({"kind": "heading", "text": s})
         else:
-            buf.append(s)
+            # Preserve Word/web single-newline paragraph breaks when a previous line is already a full paragraph
+            if buf and len(buf[-1]) >= 120 and buf[-1][-1] in ".!?)]\"'":
+                blocks.append({"kind": "para", "text": " ".join(buf)})
+                buf = [s]
+            else:
+                buf.append(s)
     if buf:
         blocks.append({"kind": "para", "text": " ".join(buf)})
     return blocks
@@ -146,20 +151,21 @@ def split_sentences(text: str) -> List[str]:
     return [p.replace("<DOT>", ".").strip() for p in parts if p.strip()]
 
 
-def chunk_paragraph(para: str, max_chunk_words: int = 65) -> List[str]:
+def chunk_paragraph(para: str, max_chunk_words: int = 160) -> List[str]:
     """
-    Split long paragraphs into balanced sentence-aligned chunks (~45-65 words each)
-    so 4B models retain full length and detail instead of compressing into a short summary.
+    Split only truly long paragraphs (> ~175 words) into balanced sentence-aligned chunks
+    (~110-160 words each). Normal 70-170 word paragraphs stay unchunked to avoid artificial
+    mid-paragraph transition seams that trigger AI detectors.
     """
     words = para.split()
-    if len(words) <= max_chunk_words + 12:
+    if len(words) <= max_chunk_words + 15:
         return [para.strip()]
 
     sents = split_sentences(para)
     if len(sents) <= 1:
         return [para.strip()]
 
-    # Aim for balanced chunks rather than leaving a tiny 10-word tail
+    # Aim for balanced chunks rather than leaving a tiny tail
     n_chunks = max(2, math.ceil(len(words) / max_chunk_words))
     target_per_chunk = len(words) / n_chunks
 
@@ -170,7 +176,7 @@ def chunk_paragraph(para: str, max_chunk_words: int = 65) -> List[str]:
     for idx, sent in enumerate(sents):
         sw = len(sent.split())
         remaining_chunks = n_chunks - len(chunks)
-        if cur and remaining_chunks > 1 and (cur_words + sw > target_per_chunk * 1.15) and cur_words >= 28:
+        if cur and remaining_chunks > 1 and (cur_words + sw > target_per_chunk * 1.15) and cur_words >= 55:
             chunks.append(" ".join(cur))
             cur = [sent]
             cur_words = sw
@@ -180,6 +186,34 @@ def chunk_paragraph(para: str, max_chunk_words: int = 65) -> List[str]:
     if cur:
         chunks.append(" ".join(cur))
     return chunks
+
+
+DEMO_LEAK_WORDS = {
+    "chang", "impala", "campus", "hunan", "ubuntu", "intel", "i5",
+    "phase-space", "warehousing", "province", "etl", "china", "chinese",
+}
+
+
+def _chunk_demo_blacklist(chunk_text: str) -> List[str]:
+    """Return demo-specific entities not present in chunk_text so they can never leak."""
+    low = chunk_text.lower()
+    return [w for w in DEMO_LEAK_WORDS if w not in low]
+
+
+def _causes_demo_leak_or_repeat(cur_text: str, tok: str, demo_ban: List[str]) -> bool:
+    """Catch BPE-split demo leaks (e.g. ' Hu'+'nan') and 3-gram repetition loops."""
+    tail = (cur_text[-60:] + tok).lower()
+    if any(b in tail for b in demo_ban):
+        return True
+    # Block exact 4-word repetition loops inside the same paragraph
+    cand = re.sub(r"\s+", " ", (cur_text + tok)).strip().lower()
+    words = cand.split()
+    if len(words) >= 8:
+        last4 = " ".join(words[-4:])
+        prev = " ".join(words[:-4])
+        if last4 in prev:
+            return True
+    return False
 
 
 def is_banned(tok: str, banned_substrs: List[str]) -> bool:
@@ -227,7 +261,7 @@ def next_token_logprobs(
 
 
 def make_seed_start(para: str, idx: int) -> str:
-    """Create a concrete, non-participial seed opening for Anti-Greedy mode."""
+    """Create a concrete, non-copying seed opening for Anti-Greedy mode."""
     stripped = para.strip()
     lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{3,55}\.)\s+(.+)$", stripped)
     if lead_m and not lead_m.group(1).lower().endswith("et al."):
@@ -240,7 +274,10 @@ def make_seed_start(para: str, idx: int) -> str:
         ]
         return starters[idx % len(starters)]
 
-    m = re.search(r"\b([A-Z][A-Za-z\-]+(?:\s+et\s+al\.|\s+and\s+[A-Z][A-Za-z\-]+))\b", stripped)
+    # Match an author name in the first three sentences
+    sents = split_sentences(stripped)
+    head_text = " ".join(sents[:3]) if sents else stripped
+    m = re.search(r"\b([A-Z][A-Za-z\-]+(?:\s+et\s+al\.|\s+and\s+[A-Z][A-Za-z\-]+))\b", head_text)
     if m:
         author = m.group(1)
         author_starters = [
@@ -251,34 +288,137 @@ def make_seed_start(para: str, idx: int) -> str:
         ]
         return author_starters[idx % len(author_starters)]
 
-    # Use a neutral continuation opener instead of copying the first 5 source words verbatim
-    cont_starters = [
-        "In this context,",
-        "At the same time,",
-        "On the practical side,",
-        "Looking more closely here,",
+    # Never copy source words[:4] verbatim (causes ZeroGPT to flag the whole paragraph).
+    # Rotate across diverse, natural plain-English openings so consecutive paragraphs never repeat a template.
+    cites = re.findall(r"\[\d+\](?:[–\-]\[\d+\])?", stripped)
+    unique_cites: List[str] = []
+    for c in cites:
+        if c not in unique_cites:
+            unique_cites.append(c)
+
+    diverse_openers = [
+        f"In the setup covered by {unique_cites[0]}," if unique_cites else "When we look at this setup,",
+        "For this stage of the deployment,",
+        f"Based on the results from {unique_cites[0]}," if unique_cites else "From the reviewed cases here,",
+        "In a practical utility setting,",
+        f"When looking closely at {unique_cites[0]} and {unique_cites[1]}," if len(unique_cites) >= 2 else "To make this work on real hardware,",
+        "On the operational side here,",
+        f"For the cases reported in {unique_cites[0]}," if unique_cites else "Before scaling up to full operation,",
+        "With these kinds of field constraints,",
     ]
-    return cont_starters[idx % len(cont_starters)]
+    return diverse_openers[idx % len(diverse_openers)]
+
+
+def _ends_clean_sentence(text: str) -> bool:
+    """True when text ends on a real sentence period (not 'et al.' or decimal '2.')."""
+    s = text.rstrip()
+    if not s.endswith("."):
+        return False
+    low = s.lower()
+    if low.endswith(("et al.", "e.g.", "i.e.", "vs.", "fig.", "eq.", "no.")):
+        return False
+    if re.search(r"\b\d{1,3}\.$", s):
+        return False
+    return s.count("(") == s.count(")")
+
+
+CONTRASTIVE_REGISTERS = [
+    (
+        "Notes from reading technical papers:\n{notes}\n\n"
+        "Rough plain prose paragraph (complete sentences, direct, concrete):\n{anchor}"
+    ),
+    (
+        "Engineering literature notes:\n{notes}\n\n"
+        "Direct plain-English technical paragraph (factual, concrete numbers, complete sentences):\n{anchor}"
+    ),
+    (
+        "Summary notes from technical studies:\n{notes}\n\n"
+        "Plain academic draft paragraph (straightforward verbs, varied sentence lengths):\n{anchor}"
+    ),
+    (
+        "Technical review notes:\n{notes}\n\n"
+        "Concrete plain-prose technical paragraph (active voice, clear facts):\n{anchor}"
+    ),
+    (
+        "Workshop paper scratch notes:\n{notes}\n\n"
+        "Unpolished academic prose paragraph (direct statements, factual, complete sentences):\n{anchor}"
+    ),
+    (
+        "Reading notes on engineering systems:\n{notes}\n\n"
+        "Plain factual paragraph (direct comparisons, concrete system details):\n{anchor}"
+    ),
+]
+
+
+def _extract_topic_phrase(para: str) -> str:
+    """Extract a concrete 2-3 word domain phrase from para to anchor Contrastive mode factually."""
+    # Prefer concrete technical systems / capitalized terms or key nouns from the first 2 sentences
+    sents = split_sentences(para.strip())
+    head = " ".join(sents[:2]) if sents else para
+    for term in [
+        "Spark Streaming", "Hadoop MapReduce", "Spark", "Flink", "Kafka", "HDFS", "HBase",
+        "FedNorm", "SMASH", "BBData", "LoRaWAN", "MQTT", "SCADA", "AMI", "iPACS-5612C1",
+        "wind-farm", "wind farm", "smart-meter", "smart meter", "microgrid", "photovoltaic",
+        "solar-farm", "edge terminal", "edge servers", "federated", "cluster tuning",
+        "centralized service", "checkpointing", "pilot project",
+    ]:
+        if term.lower() in head.lower():
+            return term
+    # Generic noun-phrase fallback: first 2 content words (>4 chars)
+    stop = {"along", "these", "methods", "which", "their", "there", "where", "while", "about", "order", "could", "would", "should", "using", "based"}
+    cands = [w.strip(".,;:()[]") for w in head.split() if len(w.strip(".,;:()[]")) >= 5 and w.strip(".,;:()[]").lower() not in stop]
+    return " ".join(cands[:2]) if cands else "this setup"
 
 
 def make_contrastive_anchor(para: str, idx: int) -> str:
-    """Create a short factual/academic pivot (breaks verbatim copy, never triggers prompt continuation)."""
+    """Create a varied, topic-grounded 3-6 word factual anchor (zero hallucination, zero repetition)."""
     stripped = para.strip()
-    lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{3,55}\.)\s+(.+)$", stripped)
-    pivots = ["In this setting,", "For these systems,", "Under this setup,", "In such cases,"]
-    if lead_m and not lead_m.group(1).lower().endswith("et al."):
-        lead_prefix = lead_m.group(1)
-        return f"{lead_prefix} {pivots[idx % len(pivots)]}"
 
-    cont_pivots = ["In this case,", "In practice,", "Under these conditions,", "For such workloads,"]
-    return cont_pivots[idx % len(cont_pivots)]
+    sents = split_sentences(stripped)
+    head = " ".join(sents[:2]) if sents else stripped
+    auth_m = re.search(r"\b([A-Z][A-Za-z\-]+(?:\s+et\s+al\.|\s+and\s+[A-Z][A-Za-z\-]+))\b", head)
+
+    cites = re.findall(r"\[\d+\](?:[–\-]\[\d+\])?", stripped)
+    unique_cites: List[str] = []
+    for c in cites:
+        if c not in unique_cites:
+            unique_cites.append(c)
+
+    lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{2,40})\.", stripped)
+    has_lead = bool(lead_m and not lead_m.group(1).lower().endswith("et al"))
+    topic = _extract_topic_phrase(stripped)
+
+    bucket = idx % 6
+    if bucket == 0 and auth_m:
+        return f"{auth_m.group(1)} looked at {topic}"
+    if bucket == 1 and unique_cites:
+        return f"On {topic} in {unique_cites[0]},"
+    if bucket == 2 and has_lead:
+        return f"For {lead_m.group(1).lower()},"
+    if bucket == 3 and auth_m:
+        return f"The {topic} setup by {auth_m.group(1)}"
+    if bucket == 4 and unique_cites:
+        return f"Looking at {topic} ({unique_cites[0]}),"
+    if bucket == 5 and unique_cites:
+        return f"For {topic} in {unique_cites[0]},"
+
+    if auth_m:
+        return f"{auth_m.group(1)} tested {topic}"
+    if has_lead:
+        return f"About {lead_m.group(1).lower()},"
+    if unique_cites:
+        return f"With {topic} in {unique_cites[0]},"
+    return f"For {topic},"
 
 
 def trim_to_last_sentence(text: str) -> str:
     # Strip any accidental few-shot label echo (e.g. "Source:", "Rewrite:", "Notes:")
     text = re.split(r"\b(?:Source|Rewrite|Notes|Paragraph)\s*:", text, maxsplit=1)[0]
     text = re.sub(r"\s+", " ", text).strip()
-    matches = list(re.finditer(r"(?<!\bal)\.(?:\s|$)", text))
+    matches = [
+        m for m in re.finditer(r"(?<!\bal)\.(?:\s|$)", text)
+        if not re.search(r"\b\d{1,3}\.$", text[: m.start() + 1])
+    ]
     if matches:
         return text[: matches[-1].start() + 1].strip()
     # Ensure chunk ends with sentence punctuation when stitched with following chunks
@@ -286,6 +426,32 @@ def trim_to_last_sentence(text: str) -> str:
     if cleaned and cleaned[-1] not in ".!?":
         cleaned += "."
     return cleaned
+
+
+AI_LEX_STEMS = (
+    "ensur", "requir", "variou", "provid", "allow", "enabl", "support", "involv",
+    "includ", "approach", "method", "manag", "integrat", "evaluat", "perform",
+    "consider", "indicat", "however", "moreover", "further", "particular",
+    "specific", "overall", "similar", "complex", "effectiv", "efficien",
+    "comprehen", "robust", "crucial", "vital", "essential", "significan",
+    "utiliz", "employ", "leverag", "demonstrat", "facilitat", "validat",
+)
+
+
+def _human_burstiness_and_lex(text: str) -> Tuple[float, float]:
+    """Return (sentence_length_std, ai_lexicon_pct) for ZeroGPT-aware local candidate ranking."""
+    sents = split_sentences(text)
+    slens = [len(s.split()) for s in sents if s.strip()]
+    if len(slens) >= 2:
+        mean_s = sum(slens) / len(slens)
+        sent_std = (sum((x - mean_s) ** 2 for x in slens) / len(slens)) ** 0.5
+    else:
+        sent_std = 0.0
+    words = [w.strip(".,;:()[]\"'").lower() for w in text.split() if w.strip(".,;:()[]\"'")]
+    if not words:
+        return sent_std, 100.0
+    hits = sum(1 for w in words if any(st in w for st in AI_LEX_STEMS))
+    return sent_std, 100.0 * hits / len(words)
 
 
 def _length_penalty_factor(actual_words: int, target_words: int) -> float:
@@ -320,13 +486,15 @@ def _rewrite_chunk_anti_greedy(
     cancel_event: Optional[threading.Event],
     prefix_so_far: str = "",
 ) -> Dict:
+    demo_ban = _chunk_demo_blacklist(chunk_text)
+    chunk_banned = banned_clean + demo_ban
     src_words = max(1, len(chunk_text.split()))
     target_words = max(20, int(round(src_words * length_ratio)))
     seed_words = len(seed_start.split())
     gen_target_words = max(15, target_words - seed_words)
     # Gate EOS/newlines directly on word progress so output matches target_words reliably
-    soft_stop_words = max(target_words - 2, int(round(target_words * 0.98)))
-    max_tokens = max(110, int(gen_target_words * 2.15) + 55)
+    soft_stop_words = max(target_words - 4, int(round(target_words * 0.94)))
+    max_tokens = max(95, int(gen_target_words * 1.70) + 40)
 
     best_result = {
         "text": chunk_text.strip(),
@@ -349,7 +517,7 @@ def _rewrite_chunk_anti_greedy(
         seed_val = base_seed + (attempt - 1) * 37
         ctx = (
             f"{demo.strip()}\n\n"
-            f"Notes (keep full detail, write about {target_words} words):\n"
+            f"Notes:\n"
             f"{chunk_text.strip()}\n\n"
             f"Paragraph:\n{seed_start}"
         )
@@ -382,7 +550,7 @@ def _rewrite_chunk_anti_greedy(
                 break
 
             cur_full_pre = re.sub(r"\s+", " ", (seed_start + gen)).strip()
-            at_sent_end = cur_full_pre.endswith(".") and not cur_full_pre.lower().endswith("et al.") and cur_full_pre.count("(") == cur_full_pre.count(")")
+            at_sent_end = _ends_clean_sentence(cur_full_pre)
             reached_len = (cur_words >= soft_stop_words and at_sent_end) or (cur_words >= int(target_words * 1.22))
 
             # Suppress premature EOS / newline until word budget reached
@@ -398,7 +566,19 @@ def _rewrite_chunk_anti_greedy(
             if reached_len and tok0 in STOP_TOKENS:
                 break
 
-            clean = [(t, lp) for (t, lp) in top if _tok_allowed(t) and not is_banned(t, banned_clean)]
+            clean = [
+                (t, lp)
+                for (t, lp) in top
+                if _tok_allowed(t)
+                and not is_banned(t, chunk_banned)
+                and not _causes_demo_leak_or_repeat(seed_start + gen, t, demo_ban)
+            ]
+            if not clean:
+                clean = [
+                    (t, lp)
+                    for (t, lp) in top
+                    if _tok_allowed(t) and not _causes_demo_leak_or_repeat(seed_start + gen, t, demo_ban)
+                ]
             if not clean:
                 clean = [(t, lp) for (t, lp) in top if _tok_allowed(t)]
             if not clean:
@@ -442,12 +622,7 @@ def _rewrite_chunk_anti_greedy(
                 })
 
             # Stop gracefully at the first clean sentence end after reaching target word budget
-            if (
-                cur_words >= soft_stop_words
-                and chosen_tok.rstrip().endswith(".")
-                and not cur_full.lower().endswith("et al.")
-                and cur_full.count("(") == cur_full.count(")")
-            ):
+            if cur_words >= soft_stop_words and _ends_clean_sentence(cur_full):
                 break
 
         elapsed = round(time.time() - t0, 2)
@@ -455,7 +630,7 @@ def _rewrite_chunk_anti_greedy(
         full = trim_to_last_sentence(seed_start + gen)
         actual_words = len(full.split())
         len_factor = _length_penalty_factor(actual_words, target_words)
-        ok_len = actual_words >= int(target_words * 0.88)
+        ok_len = actual_words >= int(target_words * 0.85)
 
         cand = {
             "text": full,
@@ -469,7 +644,7 @@ def _rewrite_chunk_anti_greedy(
             "cancelled": False,
         }
 
-        rank = ppl * len_factor
+        rank = min(ppl, 12.0) * len_factor
         if rank > best_rank and actual_words >= 10:
             best_rank = rank
             best_result = cand
@@ -493,7 +668,7 @@ def rewrite_paragraph(
     max_p1_for_skip: float = 0.88,
     pool_size: int = 6,
     min_alt_prob: float = 0.01,
-    min_ppl: float = 3.8,
+    min_ppl: float = 4.2,
     attempts: int = 3,
     base_seed: int = 401,
     banned_substrs: Optional[List[str]] = None,
@@ -505,7 +680,7 @@ def rewrite_paragraph(
         banned_substrs = DEFAULT_BANNED_SUBSTRS
     banned_clean = [b.lower().strip() for b in banned_substrs if b.strip()]
 
-    chunks = chunk_paragraph(source_para, max_chunk_words=65)
+    chunks = chunk_paragraph(source_para, max_chunk_words=160)
     demos = [demo, DEMO_B if demo == DEMO_A else DEMO_A]
 
     parts: List[str] = []
@@ -613,14 +788,15 @@ def _rewrite_chunk_contrastive(
     cancel_event: Optional[threading.Event],
     prefix_so_far: str = "",
 ) -> Dict:
+    demo_leak_ban = _chunk_demo_blacklist(chunk_text)
     src_words = max(1, len(chunk_text.split()))
     target_words = max(22, int(round(src_words * length_ratio)))
     anchor_words = len(anchor.split())
     gen_target_words = max(18, target_words - anchor_words)
 
-    # Gate EOS/newlines directly on word progress so output matches target_words reliably
-    soft_stop_words = max(target_words - 2, int(round(target_words * 0.98)))
-    max_tokens = max(110, int(gen_target_words * 2.15) + 55)
+    # Gate EOS/newlines directly on word progress without runaway 240-word rambles
+    soft_stop_words = max(target_words - 6, int(round(target_words * 0.90)))
+    max_tokens = max(95, int(gen_target_words * 1.55) + 30)
 
     best_result = {
         "text": chunk_text.strip(),
@@ -641,22 +817,20 @@ def _rewrite_chunk_contrastive(
             return best_result
 
         seed_val = base_seed + (attempt - 1) * 53
-        base_prompt = (
-            "Source:\n"
-            "Grid operators combine historical sensor logs with short-horizon weather updates to train "
-            "distributed forecasting models across multiple substations while tracking runtime and memory limits.\n\n"
-            "Rewrite:\n"
-            "In this setting, grid operators pair past sensor records with short-term weather inputs so "
-            "they can fit distributed forecast models across several substations and still keep an eye on run time and memory use.\n\n"
-            "Source:\n"
-            f"{chunk_text.strip()}\n\n"
-            f"Rewrite:\n{anchor}"
+        # Rotate natural human drafting registers + slight alpha/temp burstiness jitter
+        reg_idx = (seed_val // 17 + attempt) % len(CONTRASTIVE_REGISTERS)
+        base_prompt = CONTRASTIVE_REGISTERS[reg_idx].format(
+            notes=chunk_text.strip(),
+            anchor=anchor,
         )
         inst_prompt = (
-            f"<|im_start|>user\nRewrite the following text into a polished formal academic paragraph:\n"
+            f"<|im_start|>user\nWrite a formal academic paragraph from these notes:\n"
             f"{chunk_text.strip()}<|im_end|>\n"
             f"<|im_start|>assistant\n<think>\n\n</think>\n{anchor}"
         )
+        # Per-paragraph/attempt burstiness jitter breaks document-level uniformity while staying academic & faithful
+        alpha_jit = max(0.45, min(0.52, alpha + [0.0, 0.02, -0.02, 0.03, 0.01, -0.01][reg_idx]))
+        temp_jit = max(0.44, min(0.54, temp + [0.0, 0.03, -0.03, 0.04, 0.02, -0.02][reg_idx]))
 
         rng = random.Random(seed_val)
         gen = ""
@@ -690,7 +864,7 @@ def _rewrite_chunk_contrastive(
             min_i_lp = (min(i_map.values()) - 1.5) if i_map else -10.0
 
             cur_full_pre = re.sub(r"\s+", " ", (anchor + gen)).strip()
-            at_sent_end = cur_full_pre.endswith(".") and not cur_full_pre.lower().endswith("et al.") and cur_full_pre.count("(") == cur_full_pre.count(")")
+            at_sent_end = _ends_clean_sentence(cur_full_pre)
             reached_len = (cur_words >= soft_stop_words and at_sent_end) or (cur_words >= int(target_words * 1.22))
             top_b_lp = max(lp for _, lp in b_top)
             scored = []
@@ -703,25 +877,27 @@ def _rewrite_chunk_contrastive(
                     continue
                 if "[" in tok and tokens_since_bracket < 12:
                     continue
-                if math.exp(b_lp) < min_base_prob and b_lp < top_b_lp - 3.2:
+                if math.exp(b_lp) < min_base_prob and b_lp < top_b_lp - 3.0:
                     continue
                 i_lp = i_map.get(tok, min_i_lp)
-                c_score = b_lp - alpha * i_lp
+                c_score = b_lp - alpha_jit * i_lp
                 scored.append((tok, c_score, b_lp, i_lp))
 
             if not scored:
                 # Fallback to any clean non-stop ASCII token so we don't abort mid-paragraph
                 fallback = [(t, b_lp) for (t, b_lp) in b_top if t not in STOP_TOKENS and is_clean_ascii(t) and ("\n" not in t or reached_len)]
                 if not fallback:
+                    fallback = [(t, b_lp) for (t, b_lp) in b_top if t not in STOP_TOKENS and is_clean_ascii(t)]
+                if not fallback:
                     break
                 tok, b_lp = fallback[0]
                 i_lp = i_map.get(tok, min_i_lp)
-                scored = [(tok, b_lp - alpha * i_lp, b_lp, i_lp)]
+                scored = [(tok, b_lp - alpha_jit * i_lp, b_lp, i_lp)]
 
             scored.sort(key=lambda x: x[1], reverse=True)
             pool = scored[: max(2, pool_size)]
             mx = pool[0][1]
-            eff_temp = max(0.05, temp)
+            eff_temp = max(0.05, temp_jit)
             weights = [math.exp((x[1] - mx) / eff_temp) for x in pool]
             chosen_tok, _, b_lp, i_lp = rng.choices(pool, weights=weights, k=1)[0]
 
@@ -733,7 +909,7 @@ def _rewrite_chunk_contrastive(
             inst_nlls.append(-i_lp)
 
             cur_full = re.sub(r"\s+", " ", (anchor + gen)).strip()
-            if re.search(r"\b(?:Source|Rewrite|Notes|Paragraph)\s*:", gen):
+            if cur_words >= int(target_words * 0.75) and re.search(r"\b(?:Source|Rewrite|Notes|Paragraph)\s*:", gen):
                 break
             cur_words = len(cur_full.split())
 
@@ -752,12 +928,7 @@ def _rewrite_chunk_contrastive(
                     "tokens": len(base_nlls),
                 })
 
-            if (
-                cur_words >= soft_stop_words
-                and chosen_tok.rstrip().endswith(".")
-                and not cur_full.lower().endswith("et al.")
-                and cur_full.count("(") == cur_full.count(")")
-            ):
+            if cur_words >= soft_stop_words and _ends_clean_sentence(cur_full):
                 break
 
         elapsed = round(time.time() - t0, 2)
@@ -785,9 +956,11 @@ def _rewrite_chunk_contrastive(
         }
 
         # Cap inst_ppl influence so extreme outliers don't beat a properly-sized complete chunk
-        eff_inst = min(inst_ppl, 1500.0)
+        eff_inst = min(inst_ppl, 1200.0)
         punct_mult = 1.0 if (full.endswith(".") and full.count("(") == full.count(")")) else 0.4
-        rank = eff_inst * len_factor * punct_mult
+        # Strongly penalize severely truncated candidates (<65% target words)
+        short_mult = 1.0 if actual_words >= int(target_words * 0.65) else 0.05
+        rank = eff_inst * len_factor * punct_mult * short_mult
         if rank > best_rank and actual_words >= 10:
             best_rank = rank
             best_result = cand
@@ -807,7 +980,7 @@ def rewrite_paragraph_contrastive(
     instruct_model: str = DEFAULT_INSTRUCT_MODEL,
     length_ratio: float = DEFAULT_LENGTH_RATIO,
     alpha: float = 0.48,
-    min_base_prob: float = 0.025,
+    min_base_prob: float = 0.030,
     temp: float = 0.50,
     pool_size: int = 5,
     min_inst_ppl: float = 350.0,
@@ -822,7 +995,7 @@ def rewrite_paragraph_contrastive(
     GPTZero Mode: Length-preserving Contrastive Anti-RLHF Decoding (auto-chunks
     long paragraphs into ~80-word segments and stitches them cleanly).
     """
-    chunks = chunk_paragraph(source_para, max_chunk_words=65)
+    chunks = chunk_paragraph(source_para, max_chunk_words=160)
 
     parts: List[str] = []
     total_tokens = 0
@@ -932,7 +1105,7 @@ def main():
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_BASE, help="Ollama base URL")
     parser.add_argument("--length-ratio", type=float, default=DEFAULT_LENGTH_RATIO, help="Target output/input word ratio (default: 1.0)")
     parser.add_argument("--p-skip", type=float, default=0.72, help="Anti-greedy Rank-1 skip prob (default: 0.72)")
-    parser.add_argument("--min-ppl", type=float, default=3.8, help="Anti-greedy min target PPL (default: 3.8)")
+    parser.add_argument("--min-ppl", type=float, default=4.2, help="Anti-greedy min target PPL (default: 4.2)")
     parser.add_argument("--alpha", type=float, default=0.48, help="Contrastive anti-RLHF weight alpha (default: 0.48)")
     parser.add_argument("--min-inst-ppl", type=float, default=350.0, help="Contrastive min target InstPPL (default: 350)")
     parser.add_argument("--temp", type=float, default=0.50, help="Contrastive sampling temperature (default: 0.50)")
@@ -974,7 +1147,7 @@ def main():
         else:
             res = rewrite_paragraph(
                 blk["text"],
-                demo=demos[para_idx % 2],
+                demo=demos[para_idx % len(demos)],
                 seed_start=make_seed_start(blk["text"], para_idx),
                 ollama_base=args.ollama_url,
                 model=args.model,
