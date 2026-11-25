@@ -80,6 +80,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                 "ollama_url": core.DEFAULT_OLLAMA_BASE,
                 "model": core.DEFAULT_MODEL,
                 "instruct_model": core.DEFAULT_INSTRUCT_MODEL,
+                "length_ratio": core.DEFAULT_LENGTH_RATIO,
                 "p_skip": 0.72,
                 "min_ppl": 3.8,
                 "alpha": 0.48,
@@ -157,6 +158,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         ollama_url = body.get("ollama_url", core.DEFAULT_OLLAMA_BASE)
         model = body.get("model", core.DEFAULT_MODEL)
         instruct_model = body.get("instruct_model", core.DEFAULT_INSTRUCT_MODEL)
+        length_ratio = max(0.6, min(1.6, float(body.get("length_ratio", core.DEFAULT_LENGTH_RATIO))))
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
         alpha = float(body.get("alpha", 0.48))
@@ -215,15 +217,21 @@ class HumanizerHandler(BaseHTTPRequestHandler):
 
                 if str(b_idx) in locked_blocks:
                     info = locked_blocks[str(b_idx)]
+                    locked_txt = info.get("text", blk["text"])
+                    s_w = max(1, len(blk["text"].split()))
+                    o_w = len(locked_txt.split())
                     self._send_sse("block_done", {
                         "index": b_idx,
                         "kind": "para",
                         "mode": info.get("mode", mode),
                         "source": blk["text"],
-                        "text": info.get("text", blk["text"]),
+                        "text": locked_txt,
                         "ppl": info.get("ppl"),
                         "inst_ppl": info.get("inst_ppl"),
                         "skip_ratio": info.get("skip_ratio"),
+                        "source_words": s_w,
+                        "output_words": o_w,
+                        "length_pct": round(100.0 * o_w / s_w),
                         "elapsed": 0.0,
                         "attempt": 0,
                         "locked": True,
@@ -249,6 +257,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         ollama_base=ollama_url,
                         base_model=model,
                         instruct_model=instruct_model,
+                        length_ratio=length_ratio,
                         alpha=alpha,
                         temp=contrastive_temp,
                         pool_size=min(pool_size, 8),
@@ -273,6 +282,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         seed_start=seed_start,
                         ollama_base=ollama_url,
                         model=model,
+                        length_ratio=length_ratio,
                         p_skip_top1=p_skip,
                         pool_size=pool_size,
                         min_ppl=min_ppl,
@@ -318,6 +328,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         ollama_url = body.get("ollama_url", core.DEFAULT_OLLAMA_BASE)
         model = body.get("model", core.DEFAULT_MODEL)
         instruct_model = body.get("instruct_model", core.DEFAULT_INSTRUCT_MODEL)
+        length_ratio = max(0.6, min(1.6, float(body.get("length_ratio", core.DEFAULT_LENGTH_RATIO))))
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
         alpha = float(body.get("alpha", 0.48))
@@ -349,6 +360,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     ollama_base=ollama_url,
                     base_model=model,
                     instruct_model=instruct_model,
+                    length_ratio=length_ratio,
                     alpha=alpha,
                     temp=contrastive_temp,
                     pool_size=min(pool_size, 8),
@@ -371,6 +383,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     seed_start=seed_start,
                     ollama_base=ollama_url,
                     model=model,
+                    length_ratio=length_ratio,
                     p_skip_top1=p_skip,
                     pool_size=pool_size,
                     min_ppl=min_ppl,

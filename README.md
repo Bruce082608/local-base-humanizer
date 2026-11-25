@@ -23,6 +23,7 @@ A zero-dependency local GUI and CLI workbench for rewriting English academic and
 - **One-Click Engine Switch / 一键双引擎切换**：左侧栏一键切换 **ZeroGPT 反贪心** 与 **GPTZero 对比解码**，参数面板和结果指标徽章自动切换。
 - **Same-Vocab Contrastive Anti-RLHF Decoding / 同词表对比反 RLHF 解码**：支持自定义 `Base Model`、`Instruct Model`、`α` 权重（默认 `0.48`）、`Min InstPPL`（默认 `350`）与温度 `Temp`，自动屏蔽重复引用循环并校验完整句与括号配对。
 - **Hard AI-Buzzword Blacklist & Auto-PPL Retry / 黑名单掩码与自动重采样**：内置可编辑的 85+ AI 高危词根黑名单；任意段落未达目标 `PPL` 或 `InstPPL` 时自动更换种子重采样。
+- **Automatic Length Preservation / 长文本自动分块保字数**：长段落自动按句边界切分为 ~65 词均衡子块并按 `length_ratio`（默认 `1.00×`，支持 `0.75×–1.35×` 调节）动态控制生成预算与句号收尾，彻底解决 600+ 词输入被 4B 模型压缩截断的问题，同时在界面实时展示改写字数与保留百分比。
 - **Paragraph-Level Lock & Single-Paragraph Regen / 分段锁定与单段一键重生成**：锁定已通过检测的段落（🔒），仅对未通过的段落一键重生成（↻）；在反贪心模式下支持把已锁定段落作为 Self-Bootstrap 上下文示范。
 - **Structure Preservation & Bilingual UI / 自动保留结构与双语界面**：自动保留章节标题（`3.3.1 ...`、`# ...`）与行首引导小标题（`RQ1. ...`），支持中/英双语切换、暗/亮主题、一键复制全文、导出 `.txt` 以及顶部快捷打开 ZeroGPT / GPTZero。
 
@@ -56,7 +57,7 @@ python app.py
 
 ```bash
 python core.py --mode anti_greedy --input input.txt --output output.txt \
-  --model lab-qwen3-4b-base:latest --p-skip 0.72 --min-ppl 3.8 --attempts 3
+  --model lab-qwen3-4b-base:latest --p-skip 0.72 --min-ppl 3.8 --length-ratio 1.0 --attempts 3
 ```
 
 **GPTZero 对比反 RLHF 模式：**
@@ -64,7 +65,7 @@ python core.py --mode anti_greedy --input input.txt --output output.txt \
 ```bash
 python core.py --mode contrastive --input input.txt --output output.txt \
   --model lab-qwen3-4b-base:latest --instruct-model lab-qwen3-4b:latest \
-  --alpha 0.48 --min-inst-ppl 350 --temp 0.50 --attempts 3
+  --alpha 0.48 --min-inst-ppl 350 --temp 0.50 --length-ratio 1.0 --attempts 3
 ```
 
 ---

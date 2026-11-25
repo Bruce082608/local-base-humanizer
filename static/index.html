@@ -144,6 +144,15 @@
           </div>
 
           <!-- Shared Parameters -->
+          <div class="field">
+            <div class="field-row">
+              <label for="lengthRatio" data-i18n="lengthRatioLabel">目标字数比例 (Length)</label>
+              <span id="lengthRatioVal" class="mono-val">1.00×</span>
+            </div>
+            <input id="lengthRatio" type="range" min="0.75" max="1.35" step="0.05" value="1.00" />
+            <p class="hint" data-i18n="lengthRatioHint">长段落自动按句分块改写，保持与原文接近字数</p>
+          </div>
+
           <div class="field-grid-2">
             <div class="field">
               <label for="attempts" data-i18n="attemptsLabel">单段最大重试</label>

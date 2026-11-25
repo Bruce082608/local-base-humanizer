@@ -27,6 +27,8 @@ const I18N = {
     minInstPplLabel: "目标指令困惑度 (Min InstPPL)",
     minInstPplHint: "InstPPL ≥ 350 时可同时绕过 GPTZero 的生成与改写检测",
     tempLabel: "采样温度 (Temp)",
+    lengthRatioLabel: "目标字数比例 (Length)",
+    lengthRatioHint: "长段落自动按句分块改写，保持与原文接近字数",
     attemptsLabel: "单段最大重试",
     poolLabel: "候选词池 (K)",
     seedLabel: "基础随机种子 (Seed)",
@@ -90,6 +92,8 @@ const I18N = {
     minInstPplLabel: "Min Target InstPPL",
     minInstPplHint: "InstPPL ≥ 350 reliably clears GPTZero 5.0b AI & Paraphrase detectors",
     tempLabel: "Temperature (Temp)",
+    lengthRatioLabel: "Target Length Ratio",
+    lengthRatioHint: "Long paragraphs auto-split on sentences to preserve word count",
     attemptsLabel: "Max Retries",
     poolLabel: "Candidate Pool (K)",
     seedLabel: "Base Seed",
@@ -220,16 +224,23 @@ function getMergedText() {
 function updateOutputStats() {
   const merged = getMergedText();
   const words = merged ? merged.split(/\s+/).length : 0;
+  const srcTxt = $("sourceInput").value.trim();
+  const srcWords = srcTxt ? srcTxt.split(/\s+/).length : 0;
+  const wordPart =
+    srcWords > 0 && words > 0
+      ? `${words}/${srcWords} ${t("wordsUnit")} (${Math.round((100 * words) / srcWords)}%)`
+      : `${words} ${t("wordsUnit")}`;
+
   const paras = state.blocks.filter((b) => b.kind === "para");
   const hasInst = paras.some((b) => typeof b.inst_ppl === "number" && b.inst_ppl > 0);
   if (hasInst) {
     const vals = paras.filter((b) => typeof b.inst_ppl === "number" && b.inst_ppl > 0).map((b) => b.inst_ppl);
     const avg = vals.length ? (vals.reduce((a, c) => a + c, 0) / vals.length).toFixed(0) : "—";
-    $("outputStats").textContent = `${words} ${t("wordsUnit")} · ${t("avgInstPpl")} ${avg}`;
+    $("outputStats").textContent = `${wordPart} · ${t("avgInstPpl")} ${avg}`;
   } else {
     const vals = paras.filter((b) => typeof b.ppl === "number" && b.ppl > 0).map((b) => b.ppl);
     const avg = vals.length ? (vals.reduce((a, c) => a + c, 0) / vals.length).toFixed(2) : "—";
-    $("outputStats").textContent = `${words} ${t("wordsUnit")} · ${t("avgPpl")} ${avg}`;
+    $("outputStats").textContent = `${wordPart} · ${t("avgPpl")} ${avg}`;
   }
   $("mergedOutput").value = merged;
 }
@@ -249,6 +260,9 @@ async function loadDefaults() {
   $("minInstPplVal").textContent = String(d.min_inst_ppl);
   $("contrastiveTemp").value = d.contrastive_temp;
   $("contrastiveTempVal").textContent = Number(d.contrastive_temp).toFixed(2);
+  const lr = d.length_ratio ?? 1.0;
+  $("lengthRatio").value = lr;
+  $("lengthRatioVal").textContent = `${Number(lr).toFixed(2)}×`;
   $("attempts").value = d.attempts;
   $("poolSize").value = d.pool_size;
   $("seedInput").value = d.seed;
@@ -320,6 +334,7 @@ function getRequestParams() {
     ollama_url: $("ollamaUrl").value.trim(),
     model: $("modelSelect").value,
     instruct_model: $("instructModelSelect").value,
+    length_ratio: parseFloat($("lengthRatio").value) || 1.0,
     p_skip: parseFloat($("pSkip").value),
     min_ppl: parseFloat($("minPpl").value),
     alpha: parseFloat($("alphaSlider").value),
@@ -369,17 +384,24 @@ function renderCards() {
     let pillLabel = "PPL —";
     let extraMeta = "";
 
+    const srcWords = b.source ? b.source.trim().split(/\s+/).filter(Boolean).length : 0;
+    const outWords = b.text ? b.text.trim().split(/\s+/).filter(Boolean).length : 0;
+    const wordMeta =
+      !b.running && srcWords > 0 && outWords > 0
+        ? ` · ${outWords}/${srcWords}w (${Math.round((100 * outWords) / srcWords)}%)`
+        : "";
+
     if (b.running) {
       pillClass = "ppl-busy";
       pillLabel = `${t("runningAttempt")} ${b.statusText || "..."}`;
     } else if (isContrastiveBlock && typeof b.inst_ppl === "number") {
       pillClass = b.inst_ppl >= minInstPpl ? "ppl-good" : "ppl-warn";
       pillLabel = `InstPPL ${b.inst_ppl.toFixed(0)}`;
-      extraMeta = `· BasePPL ${typeof b.ppl === "number" ? b.ppl.toFixed(1) : "—"}${b.elapsed ? ` · ${b.elapsed}s` : ""}`;
+      extraMeta = `· BasePPL ${typeof b.ppl === "number" ? b.ppl.toFixed(1) : "—"}${wordMeta}${b.elapsed ? ` · ${b.elapsed}s` : ""}`;
     } else if (typeof b.ppl === "number") {
       pillClass = b.ppl >= minPpl ? "ppl-good" : "ppl-warn";
       pillLabel = `PPL ${b.ppl.toFixed(2)}`;
-      extraMeta = b.elapsed ? `· ${b.elapsed}s${b.skip_ratio ? ` · skip ${b.skip_ratio}%` : ""}` : "";
+      extraMeta = `${wordMeta}${b.elapsed ? ` · ${b.elapsed}s` : ""}${b.skip_ratio ? ` · skip ${b.skip_ratio}%` : ""}`;
     }
 
     card.innerHTML = `
@@ -692,6 +714,7 @@ function bindEvents() {
   $("alphaSlider").addEventListener("input", () => ($("alphaVal").textContent = Number($("alphaSlider").value).toFixed(2)));
   $("minInstPpl").addEventListener("input", () => ($("minInstPplVal").textContent = $("minInstPpl").value));
   $("contrastiveTemp").addEventListener("input", () => ($("contrastiveTempVal").textContent = Number($("contrastiveTemp").value).toFixed(2)));
+  $("lengthRatio").addEventListener("input", () => ($("lengthRatioVal").textContent = `${Number($("lengthRatio").value).toFixed(2)}×`));
 
   $("btnRandSeed").addEventListener("click", () => {
     $("seedInput").value = String(Math.floor(100 + Math.random() * 9900));
@@ -709,6 +732,9 @@ function bindEvents() {
     $("minInstPplVal").textContent = String(state.defaults.min_inst_ppl);
     $("contrastiveTemp").value = state.defaults.contrastive_temp;
     $("contrastiveTempVal").textContent = Number(state.defaults.contrastive_temp).toFixed(2);
+    const lr = state.defaults.length_ratio ?? 1.0;
+    $("lengthRatio").value = lr;
+    $("lengthRatioVal").textContent = `${Number(lr).toFixed(2)}×`;
     $("attempts").value = state.defaults.attempts;
     $("poolSize").value = state.defaults.pool_size;
     $("seedInput").value = state.defaults.seed;
