@@ -304,6 +304,9 @@ input[type="range"] {
   cursor: pointer;
   margin-top: 8px;
 }
+#contrastiveControls {
+  margin-bottom: 11px;
+}
 .checkbox-row input { margin-top: 3px; accent-color: var(--accent); }
 
 .hint {

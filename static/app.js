@@ -23,10 +23,13 @@ const I18N = {
     minPplLabel: "目标最低困惑度 (Min PPL)",
     minPplHint: "低于此值时自动更换随机种子重采样",
     alphaLabel: "反 RLHF 权重 (α)",
-    alphaHint: "log P_base − α·log P_instruct，推荐 0.45–0.52",
+    alphaHint: "log P_base − α·log P_instruct，推荐 0.48–0.64",
     minInstPplLabel: "目标指令困惑度 (Min InstPPL)",
     minInstPplHint: "InstPPL ≥ 350 时可同时绕过 GPTZero 的生成与改写检测",
     tempLabel: "采样温度 (Temp)",
+    telegraphicLabel: "Stage-0 去 AI 骨架电报体预处理",
+    judgeLabel: "本地只读忠实度裁判重排 (Judge)",
+    factGuardLabel: "数值/引用防幻觉白名单 (Fact Guard)",
     lengthRatioLabel: "目标字数比例 (Length)",
     lengthRatioHint: "长段落自动按句分块改写，保持与原文接近字数",
     attemptsLabel: "单段最大重试",
@@ -88,10 +91,13 @@ const I18N = {
     minPplLabel: "Min Target Perplexity (PPL)",
     minPplHint: "Resamples automatically with a fresh seed when PPL is lower",
     alphaLabel: "Anti-RLHF Weight (α)",
-    alphaHint: "log P_base − α·log P_instruct (recommended 0.45–0.52)",
+    alphaHint: "log P_base − α·log P_instruct (recommended 0.48–0.64)",
     minInstPplLabel: "Min Target InstPPL",
     minInstPplHint: "InstPPL ≥ 350 reliably clears GPTZero 5.0b AI & Paraphrase detectors",
     tempLabel: "Temperature (Temp)",
+    telegraphicLabel: "Stage-0 Telegraphic Notes (Anti-Paraphrase)",
+    judgeLabel: "Read-Only Local Faithfulness Judge",
+    factGuardLabel: "Strict Numeric & Citation Fact Guard",
     lengthRatioLabel: "Target Length Ratio",
     lengthRatioHint: "Long paragraphs auto-split on sentences to preserve word count",
     attemptsLabel: "Max Retries",
@@ -143,6 +149,7 @@ const state = {
   view: "cards",
   mode: "anti_greedy", // "anti_greedy" | "contrastive"
   defaults: null,
+  modelsLoaded: false,
   blocks: [],
   activeJobId: null,
   abortController: null,
@@ -266,6 +273,9 @@ async function loadDefaults() {
   $("attempts").value = d.attempts;
   $("poolSize").value = d.pool_size;
   $("seedInput").value = d.seed;
+  $("useTelegraphic").checked = d.use_telegraphic ?? true;
+  $("constrainFacts").checked = d.constrain_facts ?? true;
+  $("useJudge").checked = d.use_judge ?? true;
   $("blacklistText").value = d.banned_substrs.join(", ");
   updateBlacklistCount();
 }
@@ -305,19 +315,20 @@ async function refreshModels() {
       });
 
       const prefBase =
-        data.models.find((m) => m.name === prevBase) ||
-        data.models.find((m) => m.name === (state.defaults && state.defaults.model)) ||
+        (state.modelsLoaded && data.models.find((m) => m.name === prevBase)) ||
         data.models.find((m) => m.is_base) ||
+        data.models.find((m) => m.name === (state.defaults && state.defaults.model)) ||
         data.models[0];
       if (prefBase) baseSel.value = prefBase.name;
 
       const prefInst =
-        data.models.find((m) => m.name === prevInst && !m.is_base) ||
+        (state.modelsLoaded && data.models.find((m) => m.name === prevInst && !m.is_base)) ||
         data.models.find((m) => m.name === (state.defaults && state.defaults.instruct_model)) ||
         data.models.find((m) => m.name === "qwen3:4b") ||
         data.models.find((m) => !m.is_base) ||
         data.models[0];
       if (prefInst) instSel.value = prefInst.name;
+      state.modelsLoaded = true;
     } else {
       pill.className = "status-pill status-offline";
       textEl.textContent = t("ollamaOffline");
@@ -343,6 +354,9 @@ function getRequestParams() {
     attempts: parseInt($("attempts").value, 10) || 3,
     pool_size: parseInt($("poolSize").value, 10) || 6,
     seed: parseInt($("seedInput").value, 10) || 401,
+    use_telegraphic: $("useTelegraphic").checked,
+    constrain_facts: $("constrainFacts").checked,
+    use_judge: $("useJudge").checked,
     banned_substrs: getBlacklist(),
     use_bootstrap: $("useBootstrap").checked,
   };
@@ -404,11 +418,17 @@ function renderCards() {
       extraMeta = `${wordMeta}${b.elapsed ? ` · ${b.elapsed}s` : ""}${b.skip_ratio ? ` · skip ${b.skip_ratio}%` : ""}`;
     }
 
+    const fidBadge =
+      !b.running && typeof b.fidelity_pct === "number"
+        ? `<span class="ppl-pill ${b.fidelity_pct >= 85 ? "ppl-good" : "ppl-warn"}">Fid ${b.fidelity_pct}%${typeof b.judge_score === "number" ? ` · J${b.judge_score}` : ""}</span>`
+        : "";
+
     card.innerHTML = `
       <div class="card-top">
         <div class="card-meta">
           <span class="card-label">${t("paraPrefix")} #${paraCounter}</span>
           <span class="ppl-pill ${pillClass}">${pillLabel}</span>
+          ${fidBadge}
           <span class="stat-mini">${extraMeta}</span>
         </div>
         <div class="card-actions">
@@ -521,6 +541,8 @@ async function runAll() {
         ppl: b.ppl,
         inst_ppl: b.inst_ppl,
         skip_ratio: b.skip_ratio,
+        fidelity_pct: b.fidelity_pct,
+        judge_score: b.judge_score,
       };
     }
   });
@@ -554,6 +576,8 @@ async function runAll() {
           ppl: lockedBlocks[String(i)]?.ppl ?? null,
           inst_ppl: lockedBlocks[String(i)]?.inst_ppl ?? null,
           skip_ratio: lockedBlocks[String(i)]?.skip_ratio ?? null,
+          fidelity_pct: lockedBlocks[String(i)]?.fidelity_pct ?? null,
+          judge_score: lockedBlocks[String(i)]?.judge_score ?? null,
           locked: Boolean(lockedBlocks[String(i)]),
           running: false,
         }));
@@ -738,6 +762,9 @@ function bindEvents() {
     $("attempts").value = state.defaults.attempts;
     $("poolSize").value = state.defaults.pool_size;
     $("seedInput").value = state.defaults.seed;
+    $("useTelegraphic").checked = state.defaults.use_telegraphic ?? true;
+    $("constrainFacts").checked = state.defaults.constrain_facts ?? true;
+    $("useJudge").checked = state.defaults.use_judge ?? true;
   });
 
   $("btnResetBlacklist").addEventListener("click", () => {

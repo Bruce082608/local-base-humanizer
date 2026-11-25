@@ -83,12 +83,16 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                 "length_ratio": core.DEFAULT_LENGTH_RATIO,
                 "p_skip": 0.72,
                 "min_ppl": 3.8,
-                "alpha": 0.48,
+                "alpha": 0.56,
                 "min_inst_ppl": 350,
-                "contrastive_temp": 0.50,
-                "attempts": 3,
+                "contrastive_temp": 0.62,
+                "attempts": 4,
                 "pool_size": 6,
                 "seed": 401,
+                "num_ctx": core.DEFAULT_NUM_CTX,
+                "use_telegraphic": True,
+                "constrain_facts": True,
+                "use_judge": True,
                 "banned_substrs": core.DEFAULT_BANNED_SUBSTRS,
             })
         if path == "/api/models":
@@ -161,12 +165,16 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         length_ratio = max(0.6, min(1.6, float(body.get("length_ratio", core.DEFAULT_LENGTH_RATIO))))
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
-        alpha = float(body.get("alpha", 0.48))
+        alpha = float(body.get("alpha", 0.56))
         min_inst_ppl = float(body.get("min_inst_ppl", 350.0))
-        contrastive_temp = float(body.get("contrastive_temp", 0.50))
+        contrastive_temp = float(body.get("contrastive_temp", 0.62))
         attempts = int(body.get("attempts", 3))
         pool_size = int(body.get("pool_size", 6))
         base_seed = int(body.get("seed", 401))
+        num_ctx = max(512, min(8192, int(body.get("num_ctx", core.DEFAULT_NUM_CTX))))
+        use_telegraphic = bool(body.get("use_telegraphic", True))
+        constrain_facts = bool(body.get("constrain_facts", True))
+        use_judge = bool(body.get("use_judge", True))
         banned = body.get("banned_substrs", core.DEFAULT_BANNED_SUBSTRS)
         locked_blocks = body.get("locked_blocks", {})
         use_bootstrap = bool(body.get("use_bootstrap", True))
@@ -229,6 +237,8 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         "ppl": info.get("ppl"),
                         "inst_ppl": info.get("inst_ppl"),
                         "skip_ratio": info.get("skip_ratio"),
+                        "fidelity_pct": info.get("fidelity_pct"),
+                        "judge_score": info.get("judge_score"),
                         "source_words": s_w,
                         "output_words": o_w,
                         "length_pct": round(100.0 * o_w / s_w),
@@ -264,6 +274,10 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         min_inst_ppl=min_inst_ppl,
                         attempts=attempts,
                         base_seed=base_seed + para_idx * 101,
+                        use_telegraphic=use_telegraphic,
+                        constrain_facts=constrain_facts,
+                        use_judge=use_judge,
+                        num_ctx=num_ctx,
                         on_progress=on_prog,
                         cancel_event=cancel_ev,
                     )
@@ -289,6 +303,8 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         attempts=attempts,
                         base_seed=base_seed + para_idx * 101,
                         banned_substrs=banned,
+                        constrain_facts=constrain_facts,
+                        num_ctx=num_ctx,
                         on_progress=on_prog,
                         cancel_event=cancel_ev,
                     )
@@ -331,12 +347,16 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         length_ratio = max(0.6, min(1.6, float(body.get("length_ratio", core.DEFAULT_LENGTH_RATIO))))
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
-        alpha = float(body.get("alpha", 0.48))
+        alpha = float(body.get("alpha", 0.56))
         min_inst_ppl = float(body.get("min_inst_ppl", 350.0))
-        contrastive_temp = float(body.get("contrastive_temp", 0.50))
+        contrastive_temp = float(body.get("contrastive_temp", 0.62))
         attempts = int(body.get("attempts", 3))
         pool_size = int(body.get("pool_size", 6))
         seed = int(body.get("seed", random.randint(1000, 99999)))
+        num_ctx = max(512, min(8192, int(body.get("num_ctx", core.DEFAULT_NUM_CTX))))
+        use_telegraphic = bool(body.get("use_telegraphic", True))
+        constrain_facts = bool(body.get("constrain_facts", True))
+        use_judge = bool(body.get("use_judge", True))
         banned = body.get("banned_substrs", core.DEFAULT_BANNED_SUBSTRS)
         custom_demo = body.get("bootstrap_demo")
 
@@ -367,6 +387,10 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     min_inst_ppl=min_inst_ppl,
                     attempts=attempts,
                     base_seed=seed,
+                    use_telegraphic=use_telegraphic,
+                    constrain_facts=constrain_facts,
+                    use_judge=use_judge,
+                    num_ctx=num_ctx,
                     on_progress=on_prog,
                     cancel_event=cancel_ev,
                 )
@@ -390,6 +414,8 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     attempts=attempts,
                     base_seed=seed,
                     banned_substrs=banned,
+                    constrain_facts=constrain_facts,
+                    num_ctx=num_ctx,
                     on_progress=on_prog,
                     cancel_event=cancel_ev,
                 )

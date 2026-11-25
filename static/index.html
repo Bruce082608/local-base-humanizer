@@ -119,10 +119,10 @@
             <div class="field">
               <div class="field-row">
                 <label for="alphaSlider" data-i18n="alphaLabel">反 RLHF 权重 (α)</label>
-                <span id="alphaVal" class="mono-val">0.48</span>
+                <span id="alphaVal" class="mono-val">0.56</span>
               </div>
-              <input id="alphaSlider" type="range" min="0.10" max="0.80" step="0.02" value="0.48" />
-              <p class="hint" data-i18n="alphaHint">log P_base − α·log P_instruct，推荐 0.45–0.52</p>
+              <input id="alphaSlider" type="range" min="0.15" max="0.95" step="0.02" value="0.56" />
+              <p class="hint" data-i18n="alphaHint">log P_base − α·log P_instruct，推荐 0.48–0.64</p>
             </div>
 
             <div class="field">
@@ -131,16 +131,26 @@
                 <span id="minInstPplVal" class="mono-val">350</span>
               </div>
               <input id="minInstPpl" type="range" min="50" max="1000" step="25" value="350" />
-              <p class="hint" data-i18n="minInstPplHint">InstPPL ≥ 350 时可同时绕过 GPTZero 的生成与改写检测</p>
+              <p class="hint" data-i18n="minInstPplHint">InstPPL ≥ 350 且 BasePPL ≥ 6.5 时可同时绕过 GPTZero 的生成与改写检测</p>
             </div>
 
             <div class="field">
               <div class="field-row">
                 <label for="contrastiveTemp" data-i18n="tempLabel">采样温度 (Temp)</label>
-                <span id="contrastiveTempVal" class="mono-val">0.50</span>
+                <span id="contrastiveTempVal" class="mono-val">0.62</span>
               </div>
-              <input id="contrastiveTemp" type="range" min="0.20" max="1.00" step="0.05" value="0.50" />
+              <input id="contrastiveTemp" type="range" min="0.20" max="1.00" step="0.02" value="0.62" />
             </div>
+
+            <label id="telegraphicWrap" class="checkbox-row">
+              <input id="useTelegraphic" type="checkbox" checked />
+              <span data-i18n="telegraphicLabel">Stage-0 去 AI 骨架电报体预处理</span>
+            </label>
+
+            <label id="judgeWrap" class="checkbox-row">
+              <input id="useJudge" type="checkbox" checked />
+              <span data-i18n="judgeLabel">本地只读忠实度裁判重排 (Judge)</span>
+            </label>
           </div>
 
           <!-- Shared Parameters -->
@@ -171,6 +181,11 @@
               <button id="btnRandSeed" class="btn btn-ghost btn-sm" title="Randomize seed">🎲</button>
             </div>
           </div>
+
+          <label id="factGuardWrap" class="checkbox-row">
+            <input id="constrainFacts" type="checkbox" checked />
+            <span data-i18n="factGuardLabel">数值/引用防幻觉白名单 (Fact Guard)</span>
+          </label>
 
           <label id="bootstrapWrap" class="checkbox-row">
             <input id="useBootstrap" type="checkbox" checked />
