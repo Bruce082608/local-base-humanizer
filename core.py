@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Core engine for Local Base-Model Anti-Greedy Humanizer (Ollama).
+Core engine for Local Base-Model Humanizer Studio (Ollama).
 
-Uses an unaligned local base model (e.g. lab-qwen3-4b-base:latest) with:
-  1. Token-level logprobs anti-greedy decoding (skipping Rank-1 at content word starts)
-  2. Hard AI-buzzword logit blacklist filtering
-  3. Alternating verified 0%-AI in-context style demonstrations (plus optional self-bootstrapping)
-  4. Automatic per-paragraph perplexity (PPL) verification & resampling
+Supports two complementary local decoding engines:
+  1. anti_greedy (ZeroGPT Mode):
+     Unaligned local base model with token-level logprobs rank-1 skipping,
+     hard AI-buzzword logit blacklist filtering, alternating verified 0%-AI
+     in-context demos, and automatic per-paragraph PPL retry.
+  2. contrastive (GPTZero Mode — Contrastive Anti-RLHF Decoding):
+     Same-vocabulary local pair (Base model minus alpha * Instruct model):
+       score(t) = log P_base(t) - alpha * log P_instruct(t)
+     Mathematically cancels RLHF/instruction-tuned token shifts while staying
+     within the base model's plausible pre-training distribution, tracking
+     both BasePPL and InstPPL to bypass both AI-Generated and AI-Paraphrased
+     classifiers.
 """
 
 import argparse
@@ -17,12 +24,12 @@ import re
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
 DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "lab-qwen3-4b-base:latest"
+DEFAULT_INSTRUCT_MODEL = "lab-qwen3-4b:latest"
 
 DEFAULT_BANNED_SUBSTRS = [
     "utiliz", "employ", "leverag", "demonstrat", "illustrat", "highlight",
@@ -55,7 +62,7 @@ In the wind-power system that was built by Liu et al. [3], ultra-short-term pred
 
 HEADING_RE = re.compile(r"^(?:#{1,6}\s+|\d+(?:\.\d+)*\s+[A-Z]).{0,100}$")
 WORD_START_RE = re.compile(r"^ [A-Za-z][A-Za-z'\-]*$")
-STOP_TOKENS = ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "")
+STOP_TOKENS = ("<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<think>", "</think>", "")
 
 
 def normalize_ollama_base(url: str) -> str:
@@ -83,7 +90,6 @@ def list_ollama_models(ollama_base: str = DEFAULT_OLLAMA_BASE, timeout: float = 
                 for m in models
                 if m.get("name")
             ]
-            # Sort base models first for convenience
             result.sort(key=lambda x: (not x["is_base"], x["name"]))
             return True, result, ""
     except Exception as exc:
@@ -137,6 +143,7 @@ def next_token_logprobs(
     raw_prompt: str,
     top_k: int = 20,
     timeout: float = 60.0,
+    keep_alive: str = "10m",
 ) -> Tuple[Optional[str], List[Tuple[str, float]]]:
     url = f"{normalize_ollama_base(ollama_base)}/api/generate"
     payload = {
@@ -144,6 +151,7 @@ def next_token_logprobs(
         "prompt": raw_prompt,
         "raw": True,
         "stream": False,
+        "keep_alive": keep_alive,
         "logprobs": True,
         "top_logprobs": top_k,
         "options": {"num_predict": 1, "temperature": 0.0},
@@ -163,7 +171,7 @@ def next_token_logprobs(
 
 
 def make_seed_start(para: str, idx: int) -> str:
-    """Create a concrete, non-participial seed opening tailored to the paragraph."""
+    """Create a concrete, non-participial seed opening for Anti-Greedy mode."""
     stripped = para.strip()
     lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{3,55}\.)\s+(.+)$", stripped)
     if lead_m and not lead_m.group(1).lower().endswith("et al."):
@@ -189,6 +197,38 @@ def make_seed_start(para: str, idx: int) -> str:
 
     words = stripped.split()
     return " ".join(words[:5])
+
+
+def make_contrastive_anchor(para: str, idx: int) -> str:
+    """Create a minimal 2-4 word factual anchor (zero LLM prose prefix) for Contrastive mode."""
+    stripped = para.strip()
+    cites = re.findall(r"\[\d+\](?:[–\-]\[\d+\])?", stripped)
+    if cites:
+        unique_cites: List[str] = []
+        for c in cites:
+            if c not in unique_cites:
+                unique_cites.append(c)
+        if len(unique_cites) >= 2:
+            c_pair = f"{unique_cites[0]} and {unique_cites[1]}"
+            templates = [
+                f"In {c_pair},",
+                f"For {c_pair},",
+                f"Looking at {c_pair},",
+            ]
+            return templates[idx % len(templates)]
+        c_one = unique_cites[0]
+        templates = [
+            f"In {c_one},",
+            f"For {c_one},",
+        ]
+        return templates[idx % len(templates)]
+
+    lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{2,40})\.", stripped)
+    if lead_m and not lead_m.group(1).lower().endswith("et al"):
+        return f"For {lead_m.group(1).lower()},"
+
+    words = stripped.split()
+    return " ".join(words[:3])
 
 
 def trim_to_last_sentence(text: str) -> str:
@@ -218,7 +258,7 @@ def rewrite_paragraph(
     on_progress: Optional[Callable[[Dict], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict:
-    """Rewrite a single paragraph with anti-greedy decoding and automatic PPL retries."""
+    """ZeroGPT Mode: Rewrite a single paragraph with anti-greedy decoding & blacklist."""
     if banned_substrs is None:
         banned_substrs = DEFAULT_BANNED_SUBSTRS
     banned_clean = [b.lower().strip() for b in banned_substrs if b.strip()]
@@ -228,8 +268,10 @@ def rewrite_paragraph(
         max_tokens = max(95, min(220, int(word_count * 1.45)))
 
     best_result = {
+        "mode": "anti_greedy",
         "text": source_para.strip(),
         "ppl": 0.0,
+        "inst_ppl": None,
         "tokens": 0,
         "skipped": 0,
         "word_starts": 0,
@@ -257,6 +299,7 @@ def rewrite_paragraph(
         if on_progress:
             on_progress({
                 "event": "attempt_start",
+                "mode": "anti_greedy",
                 "attempt": attempt,
                 "attempts": attempts,
                 "seed": seed_val,
@@ -304,6 +347,7 @@ def rewrite_paragraph(
                 running_ppl = math.exp(sum(nlls) / max(len(nlls), 1))
                 on_progress({
                     "event": "token",
+                    "mode": "anti_greedy",
                     "attempt": attempt,
                     "attempts": attempts,
                     "text": seed_start + gen,
@@ -321,8 +365,10 @@ def rewrite_paragraph(
         skip_ratio = round(100.0 * skipped / max(1, word_starts), 1)
 
         cand = {
+            "mode": "anti_greedy",
             "text": full,
             "ppl": round(ppl, 2),
+            "inst_ppl": None,
             "tokens": len(nlls),
             "skipped": skipped,
             "word_starts": word_starts,
@@ -346,19 +392,214 @@ def rewrite_paragraph(
     return best_result
 
 
+def rewrite_paragraph_contrastive(
+    source_para: str,
+    anchor: str,
+    *,
+    ollama_base: str = DEFAULT_OLLAMA_BASE,
+    base_model: str = DEFAULT_MODEL,
+    instruct_model: str = DEFAULT_INSTRUCT_MODEL,
+    alpha: float = 0.48,
+    min_base_prob: float = 0.025,
+    temp: float = 0.50,
+    pool_size: int = 5,
+    min_inst_ppl: float = 350.0,
+    min_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    attempts: int = 3,
+    base_seed: int = 401,
+    on_progress: Optional[Callable[[Dict], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> Dict:
+    """
+    GPTZero Mode: Contrastive Anti-RLHF Decoding using a same-vocabulary pair:
+      score(t) = log P_base(t) - alpha * log P_instruct(t)
+    Cancels RLHF/instruct-boosted phrasing without punching unnatural rank-1 holes.
+    """
+    word_count = max(1, len(source_para.split()))
+    if min_tokens is None:
+        min_tokens = max(45, min(75, int(word_count * 0.65)))
+    if max_tokens is None:
+        max_tokens = max(95, min(145, int(word_count * 1.25)))
+
+    best_result = {
+        "mode": "contrastive",
+        "text": source_para.strip(),
+        "ppl": 0.0,
+        "inst_ppl": 0.0,
+        "alpha": alpha,
+        "tokens": 0,
+        "skipped": 0,
+        "word_starts": 0,
+        "skip_ratio": None,
+        "attempt": 0,
+        "seed": base_seed,
+        "elapsed": 0.0,
+        "cancelled": False,
+    }
+    best_score = -1.0
+
+    for attempt in range(1, max(1, attempts) + 1):
+        if cancel_event and cancel_event.is_set():
+            best_result["cancelled"] = True
+            return best_result
+
+        seed_val = base_seed + (attempt - 1) * 53
+        base_prompt = (
+            f"Notes from reading energy big-data papers:\n{source_para.strip()}\n\n"
+            f"Rough plain prose paragraph (complete sentences, direct, concrete):\n{anchor}"
+        )
+        inst_prompt = (
+            f"<|im_start|>user\nWrite a formal academic paragraph from these notes:\n"
+            f"{source_para.strip()}<|im_end|>\n"
+            f"<|im_start|>assistant\n<think>\n\n</think>\n{anchor}"
+        )
+
+        rng = random.Random(seed_val)
+        gen = ""
+        base_nlls: List[float] = []
+        inst_nlls: List[float] = []
+        tokens_since_bracket = 20
+        t0 = time.time()
+
+        if on_progress:
+            on_progress({
+                "event": "attempt_start",
+                "mode": "contrastive",
+                "attempt": attempt,
+                "attempts": attempts,
+                "seed": seed_val,
+                "text": anchor,
+            })
+
+        for step in range(max_tokens):
+            if cancel_event and cancel_event.is_set():
+                best_result["cancelled"] = True
+                return best_result
+
+            _, b_top = next_token_logprobs(ollama_base, base_model, base_prompt + gen, top_k=20)
+            if not b_top:
+                break
+            _, i_top = next_token_logprobs(ollama_base, instruct_model, inst_prompt + gen, top_k=20)
+            i_map = {t: lp for t, lp in i_top}
+            min_i_lp = (min(i_map.values()) - 1.5) if i_map else -10.0
+
+            top_b_lp = max(lp for _, lp in b_top)
+            scored = []
+            for tok, b_lp in b_top:
+                if tok in STOP_TOKENS:
+                    continue
+                if not is_clean_ascii(tok) or "—" in tok or "–" in tok:
+                    continue
+                if "\n" in tok and step < min_tokens:
+                    continue
+                if "[" in tok and tokens_since_bracket < 12:
+                    continue
+                if math.exp(b_lp) < min_base_prob and b_lp < top_b_lp - 3.0:
+                    continue
+                i_lp = i_map.get(tok, min_i_lp)
+                c_score = b_lp - alpha * i_lp
+                scored.append((tok, c_score, b_lp, i_lp))
+
+            if not scored:
+                break
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            pool = scored[: max(2, pool_size)]
+            mx = pool[0][1]
+            eff_temp = max(0.05, temp)
+            weights = [math.exp((x[1] - mx) / eff_temp) for x in pool]
+            chosen_tok, _, b_lp, i_lp = rng.choices(pool, weights=weights, k=1)[0]
+
+            if "\n" in chosen_tok and step >= min_tokens:
+                break
+            gen += chosen_tok
+            tokens_since_bracket = 0 if "[" in chosen_tok else (tokens_since_bracket + 1)
+            base_nlls.append(-b_lp)
+            inst_nlls.append(-i_lp)
+
+            if on_progress and (step % 4 == 0 or chosen_tok.endswith(".")):
+                r_bppl = math.exp(sum(base_nlls) / max(len(base_nlls), 1))
+                r_ippl = math.exp(sum(inst_nlls) / max(len(inst_nlls), 1))
+                on_progress({
+                    "event": "token",
+                    "mode": "contrastive",
+                    "attempt": attempt,
+                    "attempts": attempts,
+                    "text": re.sub(r" {2,}", " ", anchor + " " + gen),
+                    "ppl": round(r_bppl, 2),
+                    "inst_ppl": round(r_ippl, 1),
+                    "tokens": len(base_nlls),
+                })
+
+        elapsed = round(time.time() - t0, 2)
+        base_ppl = math.exp(sum(base_nlls) / max(len(base_nlls), 1)) if base_nlls else 0.0
+        inst_ppl = math.exp(sum(inst_nlls) / max(len(inst_nlls), 1)) if inst_nlls else 0.0
+        full = trim_to_last_sentence(re.sub(r"\s+", " ", (anchor + " " + gen).strip()))
+        ok_complete = (
+            full.endswith(".")
+            and len(full) >= 95
+            and full.count("(") == full.count(")")
+        )
+
+        cand = {
+            "mode": "contrastive",
+            "text": full,
+            "ppl": round(base_ppl, 2),
+            "inst_ppl": round(inst_ppl, 1),
+            "alpha": alpha,
+            "tokens": len(base_nlls),
+            "skipped": 0,
+            "word_starts": 0,
+            "skip_ratio": None,
+            "attempt": attempt,
+            "seed": seed_val,
+            "elapsed": elapsed,
+            "ok_complete": ok_complete,
+            "cancelled": False,
+        }
+
+        if on_progress:
+            on_progress({"event": "attempt_done", **cand})
+
+        rank_score = inst_ppl if ok_complete else (inst_ppl * 0.15)
+        if rank_score > best_score and len(full) >= 40:
+            best_score = rank_score
+            best_result = cand
+
+        if ok_complete and inst_ppl >= min_inst_ppl and base_ppl >= 6.5:
+            break
+
+    return best_result
+
+
 def build_bootstrap_demo(source_para: str, rewritten_para: str) -> str:
     """Create a self-bootstrapping in-context demo from an already-verified paragraph."""
     return f"Notes:\n{source_para.strip()}\n\nParagraph:\n{rewritten_para.strip()}"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local Base-Model Anti-Greedy Humanizer CLI")
+    parser = argparse.ArgumentParser(description="Local Base-Model Humanizer CLI (ZeroGPT & GPTZero Modes)")
     parser.add_argument("--input", "-i", help="Input text file (reads stdin if omitted)")
     parser.add_argument("--output", "-o", help="Output text file (prints stdout if omitted)")
+    parser.add_argument(
+        "--mode",
+        choices=["anti_greedy", "contrastive"],
+        default="anti_greedy",
+        help="Decoding mode: anti_greedy (ZeroGPT) or contrastive (GPTZero Anti-RLHF)",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama base model (default: {DEFAULT_MODEL})")
+    parser.add_argument(
+        "--instruct-model",
+        default=DEFAULT_INSTRUCT_MODEL,
+        help=f"Same-vocab Ollama instruct model for contrastive mode (default: {DEFAULT_INSTRUCT_MODEL})",
+    )
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_BASE, help="Ollama base URL")
-    parser.add_argument("--p-skip", type=float, default=0.72, help="Rank-1 skip probability (default: 0.72)")
-    parser.add_argument("--min-ppl", type=float, default=3.8, help="Minimum target PPL per paragraph (default: 3.8)")
+    parser.add_argument("--p-skip", type=float, default=0.72, help="Anti-greedy Rank-1 skip prob (default: 0.72)")
+    parser.add_argument("--min-ppl", type=float, default=3.8, help="Anti-greedy min target PPL (default: 3.8)")
+    parser.add_argument("--alpha", type=float, default=0.48, help="Contrastive anti-RLHF weight alpha (default: 0.48)")
+    parser.add_argument("--min-inst-ppl", type=float, default=350.0, help="Contrastive min target InstPPL (default: 350)")
+    parser.add_argument("--temp", type=float, default=0.50, help="Contrastive sampling temperature (default: 0.50)")
     parser.add_argument("--attempts", type=int, default=3, help="Max resampling attempts per paragraph (default: 3)")
     parser.add_argument("--seed", type=int, default=401, help="Base random seed (default: 401)")
     args = parser.parse_args()
@@ -376,25 +617,46 @@ def main():
             out_lines.append(blk["text"])
             continue
 
-        sys.stderr.write(f"\n=== Paragraph {para_idx + 1} ===\n")
-        res = rewrite_paragraph(
-            blk["text"],
-            demo=demos[para_idx % 2],
-            seed_start=make_seed_start(blk["text"], para_idx),
-            ollama_base=args.ollama_url,
-            model=args.model,
-            p_skip_top1=args.p_skip,
-            min_ppl=args.min_ppl,
-            attempts=args.attempts,
-            base_seed=args.seed + para_idx * 101,
-            on_progress=lambda ev: (
-                sys.stderr.write(
-                    f"  attempt {ev['attempt']} | seed={ev['seed']} | {ev['elapsed']}s | PPL={ev['ppl']}\n"
-                )
-                if ev.get("event") == "attempt_done"
-                else None
-            ),
-        )
+        sys.stderr.write(f"\n=== Paragraph {para_idx + 1} ({args.mode}) ===\n")
+        if args.mode == "contrastive":
+            res = rewrite_paragraph_contrastive(
+                blk["text"],
+                anchor=make_contrastive_anchor(blk["text"], para_idx),
+                ollama_base=args.ollama_url,
+                base_model=args.model,
+                instruct_model=args.instruct_model,
+                alpha=args.alpha,
+                temp=args.temp,
+                min_inst_ppl=args.min_inst_ppl,
+                attempts=args.attempts,
+                base_seed=args.seed + para_idx * 101,
+                on_progress=lambda ev: (
+                    sys.stderr.write(
+                        f"  attempt {ev['attempt']} | seed={ev['seed']} | {ev['elapsed']}s | BasePPL={ev['ppl']} | InstPPL={ev['inst_ppl']}\n"
+                    )
+                    if ev.get("event") == "attempt_done"
+                    else None
+                ),
+            )
+        else:
+            res = rewrite_paragraph(
+                blk["text"],
+                demo=demos[para_idx % 2],
+                seed_start=make_seed_start(blk["text"], para_idx),
+                ollama_base=args.ollama_url,
+                model=args.model,
+                p_skip_top1=args.p_skip,
+                min_ppl=args.min_ppl,
+                attempts=args.attempts,
+                base_seed=args.seed + para_idx * 101,
+                on_progress=lambda ev: (
+                    sys.stderr.write(
+                        f"  attempt {ev['attempt']} | seed={ev['seed']} | {ev['elapsed']}s | PPL={ev['ppl']}\n"
+                    )
+                    if ev.get("event") == "attempt_done"
+                    else None
+                ),
+            )
         if out_lines and not is_heading(out_lines[-1]):
             out_lines.append("")
         out_lines.append(res["text"])

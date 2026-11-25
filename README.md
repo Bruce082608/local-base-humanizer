@@ -1,24 +1,30 @@
 # Local Base-Model Humanizer Studio
 
-A zero-dependency local GUI and CLI tool that rewrites English academic and technical prose using an **unaligned local Ollama base model** (`lab-qwen3-4b-base:latest` or any local base model) with **token-level `logprobs` anti-greedy decoding**, a **hard AI-buzzword logit blacklist**, **alternating style demonstrations**, and **per-paragraph self-bootstrapping**.
+A zero-dependency local GUI and CLI workbench for rewriting English academic and technical prose using **local Ollama unaligned base models** (`lab-qwen3-4b-base:latest` or any local base model), featuring **two specialized token-level `logprobs` decoding engines** targeting both **ZeroGPT** and **GPTZero (Model 5.0b)**.
 
-一款零第三方依赖的本地可视化工作台（GUI）与命令行工具，通过调用本地 Ollama **未经 RLHF 对齐的基础预训练模型**，在逐词元（token-by-token）`logprobs` 解码层执行**反贪心采样 + AI 高危词元黑名单掩码 + 困惑度自动重采样 + 单段锁定自举**，将英文学术/技术文本改写为更贴近人类分布的自然表达。
+一款零第三方依赖的本地可视化工作台（GUI）与命令行工具，内置**双本地基础模型 `logprobs` 解码引擎**，分别针对 **ZeroGPT** 与 **GPTZero（Model 5.0b 含 AI Paraphrased 检测头）** 进行了算法优化。
 
-![Local Base-Model Humanizer Studio](docs/screenshot.png)
+![Local Base-Model Humanizer Studio — Dual-Engine GUI](docs/screenshot.png)
+
+---
+
+## Dual-Engine Architecture / 双解码引擎对比
+
+| Mode / 模式 | Target / 适用场景 | Decoding Mechanism / 核心原理 | Key Metric / 关键指标 |
+| :--- | :--- | :--- | :--- |
+| **ZeroGPT 反贪心 (`anti_greedy`)** | ZeroGPT 等困惑度/词法分类器 | 单基础模型（`raw: true`）在内容词首以概率 `p_skip` 跳过 Top-1，结合 85+ AI 高危词根硬黑名单与双风格 0%-AI 上下文示范 + 已锁定段落自举（Self-Bootstrap） | `PPL ≥ 3.8` |
+| **GPTZero 对比反 RLHF (`contrastive`)** | GPTZero Model 5.0b（同时对抗 `AI Generated` 与 `AI Paraphrased` 双检测头） | 同词表双模型逐词元对比解码：`score(t) = log P_base(t) - α · log P_instruct(t)`（例如 `lab-qwen3-4b-base` 减去 `α · lab-qwen3-4b`），在不强行挖空 Rank-1 的前提下精准抵消 RLHF/指令微调偏好词，同时保持预训练语料合理性 | `InstPPL ≥ 350` & `BasePPL ≥ 6.5` |
 
 ---
 
 ## Key Features / 核心特性
 
 - **Zero External Dependencies / 零依赖即开即用**：纯 Python 3.10+ 标准库驱动本地 Web GUI（`ThreadingHTTPServer` + SSE 实时流式推送），无需 `pip install`。
-- **Unaligned Base-Model Token Steering / 基础模型词元级控制**：通过 Ollama `raw: true` 与 `logprobs: true` 接管每一步解码，在内容词首以可调概率 `p_skip` 跳过模型最容易选的 Top-1 AI 词，从 Rank `2..K` 候选词池中重采样。
-- **Hard AI-Buzzword Logit Blacklist / AI 高危词根硬屏蔽**：内置 70+ 高频 AI 词根黑名单（如 `utiliz`, `employ`, `leverag`, `demonstrat`, `illustrat`, `furthermore`, `moreover`, `allowing`, `ensuring` 等），可在界面中实时编辑与恢复默认。
-- **Auto-PPL Verification & Retry / 困惑度自动校验重采样**：每段自动计算真实困惑度（PPL），低于目标阈值（默认 `3.8`）时自动更换随机种子重采样。
-- **Paragraph-Level Lock & Self-Bootstrap / 分段锁定与一键单段重生成**：
-  - 支持对已通过检测的段落点击 **🔒 锁定**，再次运行或重生成其他段落时自动跳过已锁定段落；
-  - 开启 **Self-Bootstrap** 后，可将已锁定的高质量段落自动作为上下文风格示范，用来引导其余未通过段落的重生成。
-- **Structure Preservation / 自动保留结构**：自动识别并原样保留章节标题（`3.3.1 ...`、`# ...`）以及行首引导小标题（如 `RQ1. Framework roles.`、`Edge and federated forecasting.`）。
-- **Bilingual Dark/Light Studio UI / 双语暗亮双色界面**：支持中英文界面一键切换、暗色/亮色主题切换、自动发现本地 Ollama 模型并星标推荐 Base 模型、一键复制全文与导出 `.txt`。
+- **One-Click Engine Switch / 一键双引擎切换**：左侧栏一键切换 **ZeroGPT 反贪心** 与 **GPTZero 对比解码**，参数面板和结果指标徽章自动切换。
+- **Same-Vocab Contrastive Anti-RLHF Decoding / 同词表对比反 RLHF 解码**：支持自定义 `Base Model`、`Instruct Model`、`α` 权重（默认 `0.48`）、`Min InstPPL`（默认 `350`）与温度 `Temp`，自动屏蔽重复引用循环并校验完整句与括号配对。
+- **Hard AI-Buzzword Blacklist & Auto-PPL Retry / 黑名单掩码与自动重采样**：内置可编辑的 85+ AI 高危词根黑名单；任意段落未达目标 `PPL` 或 `InstPPL` 时自动更换种子重采样。
+- **Paragraph-Level Lock & Single-Paragraph Regen / 分段锁定与单段一键重生成**：锁定已通过检测的段落（🔒），仅对未通过的段落一键重生成（↻）；在反贪心模式下支持把已锁定段落作为 Self-Bootstrap 上下文示范。
+- **Structure Preservation & Bilingual UI / 自动保留结构与双语界面**：自动保留章节标题（`3.3.1 ...`、`# ...`）与行首引导小标题（`RQ1. ...`），支持中/英双语切换、暗/亮主题、一键复制全文、导出 `.txt` 以及顶部快捷打开 ZeroGPT / GPTZero。
 
 ---
 
@@ -26,7 +32,9 @@ A zero-dependency local GUI and CLI tool that rewrites English academic and tech
 
 1. **Python 3.10+**
 2. **Ollama**（v0.4+，支持 `/api/generate` 返回 `logprobs`）运行在本地 `http://127.0.0.1:11434`
-3. 至少拉取或导入一个本地 **Base** 基础模型（推荐 `lab-qwen3-4b-base:latest` 或其他 Qwen/Llama Base GGUF 模型）。
+3. 本地 Ollama 模型：
+   - **ZeroGPT 反贪心模式**：至少准备一个未对齐的 **Base** 模型（推荐 `lab-qwen3-4b-base:latest`）。
+   - **GPTZero 对比解码模式**：准备一组**同家族、同词表**的 Base + Instruct 模型对（例如 `lab-qwen3-4b-base:latest` + `lab-qwen3-4b:latest` 或 `qwen3:4b`）。
 
 ---
 
@@ -40,18 +48,23 @@ Windows 用户可直接双击 [`launch.bat`](launch.bat)，或在终端运行：
 python app.py
 ```
 
-默认会在浏览器自动打开 `http://127.0.0.1:8765`。
-
-可选参数：
-
-```bash
-python app.py --host 127.0.0.1 --port 8765 --no-browser
-```
+默认自动打开浏览器访问 `http://127.0.0.1:8765`。
 
 ### 2. CLI Mode / 命令行模式
 
+**ZeroGPT 反贪心模式：**
+
 ```bash
-python core.py --input input.txt --output output.txt --model lab-qwen3-4b-base:latest --p-skip 0.72 --min-ppl 3.8 --attempts 3
+python core.py --mode anti_greedy --input input.txt --output output.txt \
+  --model lab-qwen3-4b-base:latest --p-skip 0.72 --min-ppl 3.8 --attempts 3
+```
+
+**GPTZero 对比反 RLHF 模式：**
+
+```bash
+python core.py --mode contrastive --input input.txt --output output.txt \
+  --model lab-qwen3-4b-base:latest --instruct-model lab-qwen3-4b:latest \
+  --alpha 0.48 --min-inst-ppl 350 --temp 0.50 --attempts 3
 ```
 
 ---
@@ -60,25 +73,18 @@ python core.py --input input.txt --output output.txt --model lab-qwen3-4b-base:l
 
 ```text
 local-base-humanizer/
-├── app.py          # Local HTTP/SSE server & API endpoints
-├── core.py         # Anti-greedy decoding engine, blacklist mask, CLI entrypoint
+├── app.py          # Local HTTP/SSE server & dual-mode API endpoints
+├── core.py         # Anti-greedy + Contrastive Anti-RLHF decoding engines & CLI
 ├── launch.bat      # Windows one-click launcher
 ├── static/
-│   ├── index.html  # Studio GUI markup
+│   ├── index.html  # Dual-engine Studio GUI markup
 │   ├── styles.css  # Dark/Light editorial UI theme
-│   └── app.js      # SSE streaming, paragraph lock/regen, Ollama discovery, i18n
+│   └── app.js      # SSE streaming, mode switcher, paragraph lock/regen, i18n
+├── docs/
+│   └── screenshot.png
 ├── LICENSE
 └── README.md
 ```
-
----
-
-## Recommended Workflow / 推荐工作流
-
-1. 确认右上角状态灯为 **Ollama 已连接**，并选择带 `★` 标识的本地 Base 模型。
-2. 粘贴英文文本，点击 **开始改写**（默认 `p_skip = 0.72`, `Min PPL = 3.8`）。
-3. 将结果复制到检测工具检查；把已通过的段落点击 **🔒 锁定**。
-4. 勾选 **Self-Bootstrap**，对仍需优化的单个段落点击 **↻ 重生成**，即可快速收敛。
 
 ---
 

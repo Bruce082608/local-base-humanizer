@@ -14,7 +14,7 @@
         <div class="brand-mark" aria-hidden="true">H</div>
         <div>
           <h1 class="brand-title">Local Base-Model Humanizer</h1>
-          <p class="brand-sub" data-i18n="subtitle">Ollama 基础模型逐词元反贪心降 AI 率工作台</p>
+          <p class="brand-sub" data-i18n="subtitle">Ollama 本地基础模型双引擎降 AI 率工作台（ZeroGPT &amp; GPTZero）</p>
         </div>
       </div>
 
@@ -27,7 +27,10 @@
         <button id="btnLang" class="btn btn-ghost btn-sm">EN</button>
         <button id="btnTheme" class="btn btn-ghost btn-sm" title="Toggle Theme">☀</button>
         <a class="btn btn-outline btn-sm" href="https://www.zerogpt.com/" target="_blank" rel="noopener">
-          <span data-i18n="openZeroGpt">打开 ZeroGPT ↗</span>
+          <span data-i18n="openZeroGpt">ZeroGPT ↗</span>
+        </a>
+        <a class="btn btn-outline btn-sm" href="https://app.gptzero.me/" target="_blank" rel="noopener">
+          <span data-i18n="openGptZero">GPTZero ↗</span>
         </a>
       </div>
     </header>
@@ -36,6 +39,27 @@
     <main class="workspace">
       <!-- Left Sidebar: Controls -->
       <aside class="sidebar">
+        <!-- Mode Switcher Panel -->
+        <section class="panel">
+          <div class="panel-header">
+            <h2 data-i18n="engineMode">解码引擎模式</h2>
+          </div>
+          <div class="mode-switch" role="tablist">
+            <button id="btnModeAntiGreedy" class="mode-btn active" type="button">
+              <span class="mode-name" data-i18n="modeAntiGreedy">ZeroGPT 反贪心</span>
+              <span class="mode-tag">Base + Blacklist</span>
+            </button>
+            <button id="btnModeContrastive" class="mode-btn" type="button">
+              <span class="mode-name" data-i18n="modeContrastive">GPTZero 对比解码</span>
+              <span class="mode-tag">Base − α·Instruct</span>
+            </button>
+          </div>
+          <p id="modeDesc" class="hint" data-i18n="modeDescAntiGreedy">
+            单基础模型逐词元跳过 Rank-1 + 黑名单掩码，适合 ZeroGPT。
+          </p>
+        </section>
+
+        <!-- Model & Connection -->
         <section class="panel">
           <div class="panel-header">
             <h2 data-i18n="modelConfig">模型与连接</h2>
@@ -47,47 +71,86 @@
           </div>
 
           <div class="field">
-            <label for="modelSelect">
-              <span data-i18n="baseModel">本地模型（推荐 Base 未对齐模型）</span>
-            </label>
+            <label for="modelSelect" data-i18n="baseModel">基础模型（Base 未对齐模型）</label>
             <select id="modelSelect">
               <option value="lab-qwen3-4b-base:latest">lab-qwen3-4b-base:latest</option>
             </select>
-            <p class="hint" data-i18n="baseHint">带 base 标识的预训练模型抗检测效果最佳。</p>
+          </div>
+
+          <div id="instructModelField" class="field hidden">
+            <label for="instructModelSelect" data-i18n="instructModel">对比指令模型（同词表 Instruct）</label>
+            <select id="instructModelSelect">
+              <option value="lab-qwen3-4b:latest">lab-qwen3-4b:latest</option>
+            </select>
+            <p class="hint" data-i18n="instructHint">需与基础模型同家族/同词表（如 Qwen3-4B Base + Instruct）。</p>
           </div>
         </section>
 
+        <!-- Decoding Parameters -->
         <section class="panel">
           <div class="panel-header">
-            <h2 data-i18n="decodingParams">反贪心解码参数</h2>
+            <h2 data-i18n="decodingParams">解码参数</h2>
             <button id="btnResetParams" class="btn-link" data-i18n="reset">重置</button>
           </div>
 
-          <div class="field">
-            <div class="field-row">
-              <label for="pSkip" data-i18n="pSkipLabel">Top-1 跳过率 (p_skip)</label>
-              <span id="pSkipVal" class="mono-val">0.72</span>
+          <!-- Anti-Greedy Parameters -->
+          <div id="antiGreedyControls">
+            <div class="field">
+              <div class="field-row">
+                <label for="pSkip" data-i18n="pSkipLabel">Top-1 跳过率 (p_skip)</label>
+                <span id="pSkipVal" class="mono-val">0.72</span>
+              </div>
+              <input id="pSkip" type="range" min="0" max="0.95" step="0.02" value="0.72" />
+              <p class="hint" data-i18n="pSkipHint">越高越偏离大模型高频路径，建议 0.65–0.78</p>
             </div>
-            <input id="pSkip" type="range" min="0" max="0.95" step="0.02" value="0.72" />
-            <p class="hint" data-i18n="pSkipHint">越高越偏离大模型高频路径，建议 0.65–0.78</p>
+
+            <div class="field">
+              <div class="field-row">
+                <label for="minPpl" data-i18n="minPplLabel">目标最低困惑度 (Min PPL)</label>
+                <span id="minPplVal" class="mono-val">3.8</span>
+              </div>
+              <input id="minPpl" type="range" min="1.5" max="8.0" step="0.1" value="3.8" />
+              <p class="hint" data-i18n="minPplHint">低于此值时自动更换随机种子重采样</p>
+            </div>
           </div>
 
-          <div class="field">
-            <div class="field-row">
-              <label for="minPpl" data-i18n="minPplLabel">目标最低困惑度 (Min PPL)</label>
-              <span id="minPplVal" class="mono-val">3.8</span>
+          <!-- Contrastive Parameters -->
+          <div id="contrastiveControls" class="hidden">
+            <div class="field">
+              <div class="field-row">
+                <label for="alphaSlider" data-i18n="alphaLabel">反 RLHF 权重 (α)</label>
+                <span id="alphaVal" class="mono-val">0.48</span>
+              </div>
+              <input id="alphaSlider" type="range" min="0.10" max="0.80" step="0.02" value="0.48" />
+              <p class="hint" data-i18n="alphaHint">log P_base − α·log P_instruct，推荐 0.45–0.52</p>
             </div>
-            <input id="minPpl" type="range" min="1.5" max="8.0" step="0.1" value="3.8" />
-            <p class="hint" data-i18n="minPplHint">低于此值时自动更换随机种子重采样</p>
+
+            <div class="field">
+              <div class="field-row">
+                <label for="minInstPpl" data-i18n="minInstPplLabel">目标指令困惑度 (Min InstPPL)</label>
+                <span id="minInstPplVal" class="mono-val">350</span>
+              </div>
+              <input id="minInstPpl" type="range" min="50" max="1000" step="25" value="350" />
+              <p class="hint" data-i18n="minInstPplHint">InstPPL ≥ 350 时可同时绕过 GPTZero 的生成与改写检测</p>
+            </div>
+
+            <div class="field">
+              <div class="field-row">
+                <label for="contrastiveTemp" data-i18n="tempLabel">采样温度 (Temp)</label>
+                <span id="contrastiveTempVal" class="mono-val">0.50</span>
+              </div>
+              <input id="contrastiveTemp" type="range" min="0.20" max="1.00" step="0.05" value="0.50" />
+            </div>
           </div>
 
+          <!-- Shared Parameters -->
           <div class="field-grid-2">
             <div class="field">
               <label for="attempts" data-i18n="attemptsLabel">单段最大重试</label>
               <input id="attempts" type="number" min="1" max="8" value="3" />
             </div>
             <div class="field">
-              <label for="poolSize" data-i18n="poolLabel">候选词池 (2..K)</label>
+              <label for="poolSize" data-i18n="poolLabel">候选词池 (K)</label>
               <input id="poolSize" type="number" min="2" max="15" value="6" />
             </div>
           </div>
@@ -100,13 +163,14 @@
             </div>
           </div>
 
-          <label class="checkbox-row">
+          <label id="bootstrapWrap" class="checkbox-row">
             <input id="useBootstrap" type="checkbox" checked />
             <span data-i18n="bootstrapLabel">启用已锁定段落自举示范 (Self-Bootstrap)</span>
           </label>
         </section>
 
-        <section class="panel">
+        <!-- Blacklist (Anti-Greedy mode) -->
+        <section id="blacklistPanel" class="panel">
           <details id="blacklistDetails">
             <summary class="panel-header summary-header">
               <h2 data-i18n="blacklistTitle">AI 高危词元黑名单</h2>
@@ -179,7 +243,7 @@
             <div class="empty-icon">✦</div>
             <p class="empty-title" data-i18n="emptyTitle">准备就绪</p>
             <p class="empty-desc" data-i18n="emptyDesc">
-              在左侧粘贴英文文本并点击「开始改写」。生成后你可以锁定已通过 ZeroGPT 检测的段落，并对仍被标黄的单个段落一键重新生成。
+              在左侧选择「ZeroGPT 反贪心」或「GPTZero 对比解码」模式，粘贴英文文本后点击「开始改写」。生成后可锁定已通过的段落，并对单个段落一键重生成。
             </p>
           </div>
         </div>

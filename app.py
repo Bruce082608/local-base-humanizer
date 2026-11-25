@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Local Base-Model Anti-Greedy Humanizer — Zero-Dependency Local Web GUI Server.
+Local Base-Model Humanizer Studio — Zero-Dependency Local Web GUI Server.
 
-Starts a local HTTP server (default: http://127.0.0.1:8765) serving the interactive
-studio GUI with Server-Sent Events (SSE) for live per-paragraph token streaming,
-per-paragraph lock & single-paragraph regeneration, self-bootstrapping style demos,
-and live Ollama model discovery.
+Supports both:
+  - ZeroGPT Mode (Anti-Greedy + AI-Buzzword Blacklist + Self-Bootstrap)
+  - GPTZero Mode (Contrastive Anti-RLHF Decoding: log P_base - alpha * log P_instruct)
 """
 
 import argparse
 import json
 import mimetypes
-import os
-import queue
 import random
 import threading
 import webbrowser
@@ -26,7 +23,6 @@ import core
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-# Active cancellation events keyed by job_id
 ACTIVE_JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -35,7 +31,6 @@ class HumanizerHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format, *args):
-        # Keep console output clean
         pass
 
     def _send_json(self, payload, status=HTTPStatus.OK):
@@ -62,7 +57,10 @@ class HumanizerHandler(BaseHTTPRequestHandler):
             ctype = "application/octet-stream"
         data = safe_path.read_bytes()
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{ctype}; charset=utf-8" if ctype.startswith("text/") or ctype.endswith("javascript") else ctype)
+        self.send_header(
+            "Content-Type",
+            f"{ctype}; charset=utf-8" if ctype.startswith("text/") or ctype.endswith("javascript") else ctype,
+        )
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
@@ -78,10 +76,15 @@ class HumanizerHandler(BaseHTTPRequestHandler):
             return self._serve_static(path[len("/static/"):])
         if path == "/api/defaults":
             return self._send_json({
+                "mode": "anti_greedy",
                 "ollama_url": core.DEFAULT_OLLAMA_BASE,
                 "model": core.DEFAULT_MODEL,
+                "instruct_model": core.DEFAULT_INSTRUCT_MODEL,
                 "p_skip": 0.72,
                 "min_ppl": 3.8,
+                "alpha": 0.48,
+                "min_inst_ppl": 350,
+                "contrastive_temp": 0.50,
                 "attempts": 3,
                 "pool_size": 6,
                 "seed": 401,
@@ -148,17 +151,22 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
+        mode = body.get("mode", "anti_greedy")
         raw_text = body.get("text", "")
         job_id = body.get("job_id") or f"job-{random.randint(100000, 999999)}"
         ollama_url = body.get("ollama_url", core.DEFAULT_OLLAMA_BASE)
         model = body.get("model", core.DEFAULT_MODEL)
+        instruct_model = body.get("instruct_model", core.DEFAULT_INSTRUCT_MODEL)
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
+        alpha = float(body.get("alpha", 0.48))
+        min_inst_ppl = float(body.get("min_inst_ppl", 350.0))
+        contrastive_temp = float(body.get("contrastive_temp", 0.50))
         attempts = int(body.get("attempts", 3))
         pool_size = int(body.get("pool_size", 6))
         base_seed = int(body.get("seed", 401))
         banned = body.get("banned_substrs", core.DEFAULT_BANNED_SUBSTRS)
-        locked_blocks = body.get("locked_blocks", {})  # {str(index): {"text": ..., "ppl": ...}}
+        locked_blocks = body.get("locked_blocks", {})
         use_bootstrap = bool(body.get("use_bootstrap", True))
 
         blocks = core.parse_blocks(raw_text)
@@ -167,11 +175,10 @@ class HumanizerHandler(BaseHTTPRequestHandler):
             ACTIVE_JOBS[job_id] = cancel_ev
 
         self._begin_sse()
-        self._send_sse("init", {"job_id": job_id, "blocks": blocks})
+        self._send_sse("init", {"job_id": job_id, "mode": mode, "blocks": blocks})
 
-        # Collect locked human-verified paragraphs for optional self-bootstrapping
         bootstrap_demos = []
-        if use_bootstrap and locked_blocks:
+        if mode == "anti_greedy" and use_bootstrap and locked_blocks:
             for idx_str, locked_info in locked_blocks.items():
                 try:
                     idx_i = int(idx_str)
@@ -201,6 +208,7 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                         "source": blk["text"],
                         "text": blk["text"],
                         "ppl": None,
+                        "inst_ppl": None,
                         "locked": False,
                     })
                     continue
@@ -210,9 +218,11 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     self._send_sse("block_done", {
                         "index": b_idx,
                         "kind": "para",
+                        "mode": info.get("mode", mode),
                         "source": blk["text"],
                         "text": info.get("text", blk["text"]),
                         "ppl": info.get("ppl"),
+                        "inst_ppl": info.get("inst_ppl"),
                         "skip_ratio": info.get("skip_ratio"),
                         "elapsed": 0.0,
                         "attempt": 0,
@@ -221,33 +231,57 @@ class HumanizerHandler(BaseHTTPRequestHandler):
                     para_idx += 1
                     continue
 
-                demo = demos[para_idx % len(demos)]
-                seed_start = core.make_seed_start(blk["text"], para_idx)
-                self._send_sse("block_start", {
-                    "index": b_idx,
-                    "para_idx": para_idx,
-                    "seed_start": seed_start,
-                })
-
                 def on_prog(ev, _b_idx=b_idx):
                     if not self._send_sse("progress", {"index": _b_idx, **ev}):
                         cancel_ev.set()
 
-                res = core.rewrite_paragraph(
-                    blk["text"],
-                    demo=demo,
-                    seed_start=seed_start,
-                    ollama_base=ollama_url,
-                    model=model,
-                    p_skip_top1=p_skip,
-                    pool_size=pool_size,
-                    min_ppl=min_ppl,
-                    attempts=attempts,
-                    base_seed=base_seed + para_idx * 101,
-                    banned_substrs=banned,
-                    on_progress=on_prog,
-                    cancel_event=cancel_ev,
-                )
+                if mode == "contrastive":
+                    anchor = core.make_contrastive_anchor(blk["text"], para_idx)
+                    self._send_sse("block_start", {
+                        "index": b_idx,
+                        "para_idx": para_idx,
+                        "mode": "contrastive",
+                        "seed_start": anchor,
+                    })
+                    res = core.rewrite_paragraph_contrastive(
+                        blk["text"],
+                        anchor=anchor,
+                        ollama_base=ollama_url,
+                        base_model=model,
+                        instruct_model=instruct_model,
+                        alpha=alpha,
+                        temp=contrastive_temp,
+                        pool_size=min(pool_size, 8),
+                        min_inst_ppl=min_inst_ppl,
+                        attempts=attempts,
+                        base_seed=base_seed + para_idx * 101,
+                        on_progress=on_prog,
+                        cancel_event=cancel_ev,
+                    )
+                else:
+                    demo = demos[para_idx % len(demos)]
+                    seed_start = core.make_seed_start(blk["text"], para_idx)
+                    self._send_sse("block_start", {
+                        "index": b_idx,
+                        "para_idx": para_idx,
+                        "mode": "anti_greedy",
+                        "seed_start": seed_start,
+                    })
+                    res = core.rewrite_paragraph(
+                        blk["text"],
+                        demo=demo,
+                        seed_start=seed_start,
+                        ollama_base=ollama_url,
+                        model=model,
+                        p_skip_top1=p_skip,
+                        pool_size=pool_size,
+                        min_ppl=min_ppl,
+                        attempts=attempts,
+                        base_seed=base_seed + para_idx * 101,
+                        banned_substrs=banned,
+                        on_progress=on_prog,
+                        cancel_event=cancel_ev,
+                    )
 
                 if res.get("cancelled"):
                     self._send_sse("cancelled", {"job_id": job_id})
@@ -276,53 +310,77 @@ class HumanizerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
+        mode = body.get("mode", "anti_greedy")
         job_id = body.get("job_id") or f"one-{random.randint(100000, 999999)}"
         b_idx = int(body.get("index", 0))
         para_idx = int(body.get("para_idx", b_idx))
         source_para = body.get("source", "")
         ollama_url = body.get("ollama_url", core.DEFAULT_OLLAMA_BASE)
         model = body.get("model", core.DEFAULT_MODEL)
+        instruct_model = body.get("instruct_model", core.DEFAULT_INSTRUCT_MODEL)
         p_skip = float(body.get("p_skip", 0.72))
         min_ppl = float(body.get("min_ppl", 3.8))
+        alpha = float(body.get("alpha", 0.48))
+        min_inst_ppl = float(body.get("min_inst_ppl", 350.0))
+        contrastive_temp = float(body.get("contrastive_temp", 0.50))
         attempts = int(body.get("attempts", 3))
         pool_size = int(body.get("pool_size", 6))
         seed = int(body.get("seed", random.randint(1000, 99999)))
         banned = body.get("banned_substrs", core.DEFAULT_BANNED_SUBSTRS)
-        custom_demo = body.get("bootstrap_demo")  # optional {"source": ..., "text": ...}
+        custom_demo = body.get("bootstrap_demo")
 
-        if custom_demo and custom_demo.get("source") and custom_demo.get("text"):
-            demo = core.build_bootstrap_demo(custom_demo["source"], custom_demo["text"])
-        else:
-            demo = [core.DEMO_A, core.DEMO_B][para_idx % 2]
-
-        seed_start = core.make_seed_start(source_para, para_idx + random.randint(0, 3))
         cancel_ev = threading.Event()
         with JOBS_LOCK:
             ACTIVE_JOBS[job_id] = cancel_ev
 
         self._begin_sse()
-        self._send_sse("block_start", {"index": b_idx, "job_id": job_id, "seed_start": seed_start})
 
         def on_prog(ev):
             if not self._send_sse("progress", {"index": b_idx, **ev}):
                 cancel_ev.set()
 
         try:
-            res = core.rewrite_paragraph(
-                source_para,
-                demo=demo,
-                seed_start=seed_start,
-                ollama_base=ollama_url,
-                model=model,
-                p_skip_top1=p_skip,
-                pool_size=pool_size,
-                min_ppl=min_ppl,
-                attempts=attempts,
-                base_seed=seed,
-                banned_substrs=banned,
-                on_progress=on_prog,
-                cancel_event=cancel_ev,
-            )
+            if mode == "contrastive":
+                anchor = core.make_contrastive_anchor(source_para, para_idx + random.randint(0, 2))
+                self._send_sse("block_start", {"index": b_idx, "job_id": job_id, "mode": "contrastive", "seed_start": anchor})
+                res = core.rewrite_paragraph_contrastive(
+                    source_para,
+                    anchor=anchor,
+                    ollama_base=ollama_url,
+                    base_model=model,
+                    instruct_model=instruct_model,
+                    alpha=alpha,
+                    temp=contrastive_temp,
+                    pool_size=min(pool_size, 8),
+                    min_inst_ppl=min_inst_ppl,
+                    attempts=attempts,
+                    base_seed=seed,
+                    on_progress=on_prog,
+                    cancel_event=cancel_ev,
+                )
+            else:
+                if custom_demo and custom_demo.get("source") and custom_demo.get("text"):
+                    demo = core.build_bootstrap_demo(custom_demo["source"], custom_demo["text"])
+                else:
+                    demo = [core.DEMO_A, core.DEMO_B][para_idx % 2]
+                seed_start = core.make_seed_start(source_para, para_idx + random.randint(0, 3))
+                self._send_sse("block_start", {"index": b_idx, "job_id": job_id, "mode": "anti_greedy", "seed_start": seed_start})
+                res = core.rewrite_paragraph(
+                    source_para,
+                    demo=demo,
+                    seed_start=seed_start,
+                    ollama_base=ollama_url,
+                    model=model,
+                    p_skip_top1=p_skip,
+                    pool_size=pool_size,
+                    min_ppl=min_ppl,
+                    attempts=attempts,
+                    base_seed=seed,
+                    banned_substrs=banned,
+                    on_progress=on_prog,
+                    cancel_event=cancel_ev,
+                )
+
             if res.get("cancelled"):
                 self._send_sse("cancelled", {"job_id": job_id})
             else:
