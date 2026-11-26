@@ -50,17 +50,20 @@ ollama pull qwen3:4b
 
 ## Quick Start / 快速上手
 
-### 1. Launch GUI / 启动可视化界面
+### 1. Launch / Stop GUI / 一键启动与关闭可视化界面
 
-Windows 用户可直接双击 [`launch.bat`](launch.bat)，或在终端运行：
+Windows 用户可直接双击项目根目录下的脚本（后台静默运行，不残留黑框）：
+- [`start.bat`](start.bat)（或 [`launch.bat`](launch.bat)）：**一键启动**本地工作台并自动打开浏览器访问 `http://127.0.0.1:8765`（若已在运行则直接打开页面，不会重复占端口）。
+- [`stop.bat`](stop.bat)：**一键关闭**后台工作台服务并释放 `8765` 端口。
+- [`studio.bat`](studio.bat)：**交互式管理控制台**（实时查看运行状态，支持一键启动 / 关闭 / 重启 / 打开网页）。
+
+或在终端运行：
 
 ```bash
 python app.py
 # 如 8765 端口被占用，可指定其他端口：
 python app.py --port 8766
 ```
-
-默认自动打开浏览器访问 `http://127.0.0.1:8765`。
 
 ---
 
