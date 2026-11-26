@@ -509,7 +509,20 @@ input[type="range"] {
 
 .ppl-good { background: var(--green-soft); color: var(--green); }
 .ppl-warn { background: var(--amber-soft); color: var(--amber); }
+.ppl-bad  { background: var(--red-soft); color: var(--red); }
 .ppl-busy { background: var(--accent-soft); color: var(--accent); }
+.ppl-info { background: var(--surface); color: var(--text-muted); border: 1px solid var(--border); }
+
+.warn-banner {
+  margin-top: 7px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  background: var(--amber-soft);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  font-size: 11px;
+  line-height: 1.4;
+}
 
 .stat-mini {
   font-family: var(--font-mono);

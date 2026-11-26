@@ -1,0 +1,16 @@
+# Optional Step-2 Accelerators & Local Neural Surrogate Detectors
+# Core Ollama HTTP mode (including Burstiness, Human Demos, Dynamic alpha(t),
+# and Cross-Family Ollama Unconditional GLTR probing) requires ZERO pip packages.
+
+# --- Option A: Exact Full-Vocab GGUF Decoding + Exact Unconditional Binoculars ---
+# On NVIDIA CUDA (Windows/Linux), prefer prebuilt CUDA wheels or build with GGML_CUDA=on:
+#   pip install llama-cpp-python numpy
+numpy>=1.24
+llama-cpp-python>=0.2.85
+
+# --- Option B: Local Cross-Architecture Neural AI Detector (DeBERTa / RoBERTa) ---
+# Runs on CPU by default (~40-120 ms/para) so GPU VRAM stays free for 8B/4B LLMs.
+# Supports desklib/ai-text-detector-academic-v1.01, TrustSafeAI/RADAR-Vicuna-7B, etc.
+torch>=2.1
+transformers>=4.40
+sentencepiece>=0.2.0

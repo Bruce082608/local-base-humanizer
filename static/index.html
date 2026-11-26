@@ -14,16 +14,16 @@
         <div class="brand-mark" aria-hidden="true">H</div>
         <div>
           <h1 class="brand-title">Local Base-Model Humanizer</h1>
-          <p class="brand-sub" data-i18n="subtitle">Ollama 本地基础模型双引擎降 AI 率工作台（ZeroGPT &amp; GPTZero）</p>
+          <p class="brand-sub" data-i18n="subtitle">本地基础模型双引擎降 AI 率工作台（Ollama / llama.cpp 全词表 + 跨家族代理重排）</p>
         </div>
       </div>
 
       <div class="topbar-actions">
-        <div id="ollamaStatus" class="status-pill status-checking" title="Ollama Connection">
+        <div id="ollamaStatus" class="status-pill status-checking" title="Backend Status">
           <span class="status-dot"></span>
           <span class="status-text" data-i18n="ollamaChecking">检测 Ollama...</span>
         </div>
-        <button id="btnRefreshModels" class="btn btn-ghost btn-sm" title="Refresh Ollama models">↻</button>
+        <button id="btnRefreshModels" class="btn btn-ghost btn-sm" title="Refresh models & capabilities">↻</button>
         <button id="btnLang" class="btn btn-ghost btn-sm">EN</button>
         <button id="btnTheme" class="btn btn-ghost btn-sm" title="Toggle Theme">☀</button>
         <a class="btn btn-outline btn-sm" href="https://www.zerogpt.com/" target="_blank" rel="noopener">
@@ -45,44 +45,79 @@
             <h2 data-i18n="engineMode">解码引擎模式</h2>
           </div>
           <div class="mode-switch" role="tablist">
-            <button id="btnModeAntiGreedy" class="mode-btn active" type="button">
+            <button id="btnModeAntiGreedy" class="mode-btn" type="button">
               <span class="mode-name" data-i18n="modeAntiGreedy">ZeroGPT 反贪心</span>
               <span class="mode-tag">Base + Blacklist</span>
             </button>
-            <button id="btnModeContrastive" class="mode-btn" type="button">
+            <button id="btnModeContrastive" class="mode-btn active" type="button">
               <span class="mode-name" data-i18n="modeContrastive">GPTZero 对比解码</span>
-              <span class="mode-tag">Base − α·Instruct</span>
+              <span class="mode-tag">Human − α(t)·Inst</span>
             </button>
           </div>
-          <p id="modeDesc" class="hint" data-i18n="modeDescAntiGreedy">
-            单基础模型逐词元跳过 Rank-1 + 黑名单掩码，适合 ZeroGPT。
+          <p id="modeDesc" class="hint" data-i18n="modeDescContrastive">
+            人类示范引导 + 动态 Burstiness 对比解码，抵消 RLHF 偏移并结合跨家族代理重排。
           </p>
         </section>
 
-        <!-- Model & Connection -->
+        <!-- Backend & Model Configuration -->
         <section class="panel">
           <div class="panel-header">
-            <h2 data-i18n="modelConfig">模型与连接</h2>
+            <h2 data-i18n="modelConfig">推理后端与模型</h2>
           </div>
 
           <div class="field">
-            <label for="ollamaUrl" data-i18n="ollamaUrl">Ollama 地址</label>
-            <input id="ollamaUrl" type="text" value="http://127.0.0.1:11434" spellcheck="false" />
-          </div>
-
-          <div class="field">
-            <label for="modelSelect" data-i18n="baseModel">基础模型（Base 未对齐模型）</label>
-            <select id="modelSelect">
-              <option value="lab-qwen3-4b-base:latest">lab-qwen3-4b-base:latest</option>
+            <label for="backendSelect" data-i18n="backendLabel">推理后端</label>
+            <select id="backendSelect">
+              <option value="ollama">Ollama HTTP (零依赖 · Top-20)</option>
+              <option value="llama_cpp">llama.cpp GGUF (全词表精确 Logits + Binoculars)</option>
             </select>
           </div>
 
-          <div id="instructModelField" class="field hidden">
-            <label for="instructModelSelect" data-i18n="instructModel">对比指令模型（同词表 Instruct）</label>
-            <select id="instructModelSelect">
-              <option value="lab-qwen3-4b:latest">lab-qwen3-4b:latest</option>
-            </select>
-            <p class="hint" data-i18n="instructHint">需与基础模型同家族/同词表（如 Qwen3-4B Base + Instruct）。</p>
+          <!-- Ollama Backend Fields -->
+          <div id="ollamaConfigFields">
+            <div class="field">
+              <label for="ollamaUrl" data-i18n="ollamaUrl">Ollama 地址</label>
+              <input id="ollamaUrl" type="text" value="http://127.0.0.1:11434" spellcheck="false" />
+            </div>
+
+            <div class="field">
+              <label for="modelSelect" data-i18n="baseModel">基础模型（Base 未对齐模型）</label>
+              <select id="modelSelect">
+                <option value="lab-qwen3-4b-base:latest">lab-qwen3-4b-base:latest</option>
+              </select>
+            </div>
+
+            <div id="instructModelField" class="field">
+              <label for="instructModelSelect" data-i18n="instructModel">对比指令模型（同词表 Instruct）</label>
+              <select id="instructModelSelect">
+                <option value="lab-qwen3-4b:latest">lab-qwen3-4b:latest</option>
+              </select>
+              <p class="hint" data-i18n="instructHint">需与基础模型同家族/同词表（建议同尺寸如 4B+4B 或 8B+8B）。</p>
+              <div id="sizeMismatchWarn" class="warn-banner hidden"></div>
+            </div>
+          </div>
+
+          <!-- llama.cpp Full-Vocab Backend Fields -->
+          <div id="llamaCppConfigFields" class="hidden">
+            <div id="llamaCppStatusHint" class="warn-banner hidden"></div>
+
+            <div class="field">
+              <label for="baseGgufSelect" data-i18n="baseGgufLabel">Base GGUF 模型路径</label>
+              <select id="baseGgufSelect" style="margin-bottom:5px;"></select>
+              <input id="baseGgufInput" type="text" placeholder="例如 D:\models\Qwen3-8B-Base-Q4_K_M.gguf" spellcheck="false" />
+            </div>
+
+            <div id="instructGgufField" class="field">
+              <label for="instructGgufSelect" data-i18n="instructGgufLabel">Instruct GGUF 模型路径（同词表）</label>
+              <select id="instructGgufSelect" style="margin-bottom:5px;"></select>
+              <input id="instructGgufInput" type="text" placeholder="例如 D:\models\Qwen3-8B-Instruct-Q4_K_M.gguf" spellcheck="false" />
+            </div>
+
+            <div class="field">
+              <label for="gpuLayersInput" data-i18n="gpuLayersLabel">GPU Offload 层数 (-1 = 全部)</label>
+              <input id="gpuLayersInput" type="number" min="-1" max="128" value="-1" />
+              <p class="hint" data-i18n="llamaCppHint">自动扫描本地 ./models 与 Ollama GGUF；全词表精确计算无 Top-20 截断，可将重试提升至 12–16。</p>
+            </div>
           </div>
         </section>
 
@@ -94,7 +129,7 @@
           </div>
 
           <!-- Anti-Greedy Parameters -->
-          <div id="antiGreedyControls">
+          <div id="antiGreedyControls" class="hidden">
             <div class="field">
               <div class="field-row">
                 <label for="pSkip" data-i18n="pSkipLabel">Top-1 跳过率 (p_skip)</label>
@@ -115,14 +150,14 @@
           </div>
 
           <!-- Contrastive Parameters -->
-          <div id="contrastiveControls" class="hidden">
+          <div id="contrastiveControls">
             <div class="field">
               <div class="field-row">
-                <label for="alphaSlider" data-i18n="alphaLabel">反 RLHF 权重 (α)</label>
+                <label for="alphaSlider" data-i18n="alphaLabel">反 RLHF 基准权重 (α)</label>
                 <span id="alphaVal" class="mono-val">0.56</span>
               </div>
               <input id="alphaSlider" type="range" min="0.15" max="0.95" step="0.02" value="0.56" />
-              <p class="hint" data-i18n="alphaHint">log P_base − α·log P_instruct，推荐 0.48–0.64</p>
+              <p class="hint" data-i18n="alphaHint">log P_base − α(t)·log P_instruct，推荐 0.46–0.62</p>
             </div>
 
             <div class="field">
@@ -131,7 +166,7 @@
                 <span id="minInstPplVal" class="mono-val">350</span>
               </div>
               <input id="minInstPpl" type="range" min="50" max="1000" step="25" value="350" />
-              <p class="hint" data-i18n="minInstPplHint">InstPPL ≥ 350 且 BasePPL ≥ 6.5 时可同时绕过 GPTZero 的生成与改写检测</p>
+              <p class="hint" data-i18n="minInstPplHint">启用下方跨家族/神经代理后将优先以代理分数与 Burstiness 为准</p>
             </div>
 
             <div class="field">
@@ -144,12 +179,27 @@
 
             <label id="telegraphicWrap" class="checkbox-row">
               <input id="useTelegraphic" type="checkbox" checked />
-              <span data-i18n="telegraphicLabel">Stage-0 去 AI 骨架电报体预处理</span>
+              <span data-i18n="telegraphicLabel">Stage-0 多视角去骨架电报体</span>
+            </label>
+
+            <label id="dynamicAlphaWrap" class="checkbox-row">
+              <input id="dynamicAlpha" type="checkbox" checked />
+              <span data-i18n="dynamicAlphaLabel">动态 Burstiness 句级 α(t) 调制</span>
+            </label>
+
+            <label id="humanDemosWrap" class="checkbox-row">
+              <input id="useHumanDemos" type="checkbox" checked />
+              <span data-i18n="humanDemosLabel">真实人类示范对比 (仅喂给 Base)</span>
             </label>
 
             <label id="judgeWrap" class="checkbox-row">
               <input id="useJudge" type="checkbox" checked />
               <span data-i18n="judgeLabel">本地只读忠实度裁判重排 (Judge)</span>
+            </label>
+
+            <label id="cadBlindWrap" class="checkbox-row">
+              <input id="cadBlind" type="checkbox" />
+              <span data-i18n="cadBlindLabel">Blind-Instruct CAD (高忠实/轻改写)</span>
             </label>
           </div>
 
@@ -165,8 +215,8 @@
 
           <div class="field-grid-2">
             <div class="field">
-              <label for="attempts" data-i18n="attemptsLabel">单段最大重试</label>
-              <input id="attempts" type="number" min="1" max="8" value="3" />
+              <label for="attempts" data-i18n="attemptsLabel">单段最大重试 (N)</label>
+              <input id="attempts" type="number" min="1" max="32" value="4" />
             </div>
             <div class="field">
               <label for="poolSize" data-i18n="poolLabel">候选词池 (K)</label>
@@ -184,26 +234,96 @@
 
           <label id="factGuardWrap" class="checkbox-row">
             <input id="constrainFacts" type="checkbox" checked />
-            <span data-i18n="factGuardLabel">数值/引用防幻觉白名单 (Fact Guard)</span>
+            <span data-i18n="factGuardLabel">数值/引用/专名防幻觉白名单 (Fact Guard)</span>
           </label>
 
-          <label id="bootstrapWrap" class="checkbox-row">
+          <label id="bootstrapWrap" class="checkbox-row hidden">
             <input id="useBootstrap" type="checkbox" checked />
             <span data-i18n="bootstrapLabel">启用已锁定段落自举示范 (Self-Bootstrap)</span>
           </label>
         </section>
 
-        <!-- Blacklist (Anti-Greedy mode) -->
+        <!-- Step 2: Local Multi-Signal Surrogate Evaluator -->
+        <section id="surrogatePanel" class="panel">
+          <details id="surrogateDetails" open>
+            <summary class="panel-header summary-header">
+              <h2 data-i18n="surrogateTitle">跨家族代理裁判 (Step 2)</h2>
+              <span id="surrogateActiveBadge" class="badge">Burst</span>
+            </summary>
+            <div>
+              <div class="field">
+                <label for="surrogateModelSelect" data-i18n="surrogateOllamaLabel">无条件 GLTR 代理模型 (Ollama)</label>
+                <select id="surrogateModelSelect">
+                  <option value="">关闭 (仅 Burstiness / Binoculars)</option>
+                </select>
+                <p class="hint" data-i18n="surrogateOllamaHint">推荐选择与 Base 异家族的小模型（如 llama3.2 / mistral / gemma），独立无条件评估候选段。</p>
+              </div>
+
+              <div class="field">
+                <label for="neuralDetectorSelect" data-i18n="neuralDetectorLabel">本地神经 AI 检测器 (DeBERTa/RoBERTa)</label>
+                <select id="neuralDetectorSelect" style="margin-bottom:5px;">
+                  <option value="">关闭 (零依赖模式)</option>
+                  <option value="desklib/ai-text-detector-academic-v1.01">Desklib Academic DeBERTa-v3-Large</option>
+                  <option value="desklib/ai-text-detector-v1.01">Desklib General DeBERTa-v3-Large</option>
+                  <option value="TrustSafeAI/RADAR-Vicuna-7B">IBM RADAR RoBERTa-Large (对抗改写)</option>
+                  <option value="Hello-SimpleAI/chatgpt-detector-roberta">HC3 ChatGPT RoBERTa-Base (轻量)</option>
+                  <option value="__custom__">自定义 HuggingFace ID / 本地路径...</option>
+                </select>
+                <input id="neuralDetectorInput" type="text" class="hidden" placeholder="HF model ID 或本地模型目录" spellcheck="false" />
+                <div class="field-grid-2" style="margin-top:6px;margin-bottom:0;">
+                  <div class="field">
+                    <label for="neuralDeviceSelect" data-i18n="neuralDeviceLabel">检测器设备</label>
+                    <select id="neuralDeviceSelect">
+                      <option value="cpu">CPU (不占显存)</option>
+                      <option value="cuda">CUDA (GPU)</option>
+                      <option value="auto">Auto</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="surrogateProbes" data-i18n="surrogateProbesLabel">GLTR 探针数</label>
+                    <input id="surrogateProbes" type="number" min="6" max="32" value="16" />
+                  </div>
+                </div>
+                <div id="neuralCapHint" class="warn-banner hidden"></div>
+              </div>
+
+              <div id="binocularsField" class="field hidden">
+                <div class="field-row">
+                  <label for="binocularsThreshold" data-i18n="binocThreshLabel">Binoculars 达标阈值</label>
+                  <span id="binocularsThresholdVal" class="mono-val">0.90</span>
+                </div>
+                <input id="binocularsThreshold" type="range" min="0.70" max="1.05" step="0.01" value="0.90" />
+                <p class="hint" data-i18n="binocThreshHint">llama.cpp 模式下自动计算无条件精确 Binoculars（越高越像人类，通常 ≥ 0.90）。</p>
+              </div>
+            </div>
+          </details>
+        </section>
+
+        <!-- Step 1: Custom Human Style Demo Corpus -->
+        <section id="humanDemosPanel" class="panel">
+          <details id="humanDemosDetails">
+            <summary class="panel-header summary-header">
+              <h2 data-i18n="customDemosTitle">人类风格范文库</h2>
+              <span id="humanDemosBadge" class="badge">8 内置</span>
+            </summary>
+            <div class="blacklist-body">
+              <textarea id="customHumanDemosText" rows="5" spellcheck="false" placeholder="可选：粘贴你自己的 2021 年前真实人类学术段落（空行分隔，或 JSONL 格式），系统会自动优先检索作为 Base 的风格示范..."></textarea>
+              <p class="hint" data-i18n="customDemosHint">支持纯人类段落（自动提取要点）、Notes:/Paragraph: 对或 JSONL；动态隔离范文实体，绝不泄漏。</p>
+            </div>
+          </details>
+        </section>
+
+        <!-- Blacklist (Active in BOTH modes) -->
         <section id="blacklistPanel" class="panel">
           <details id="blacklistDetails">
             <summary class="panel-header summary-header">
-              <h2 data-i18n="blacklistTitle">AI 高危词元黑名单</h2>
+              <h2 data-i18n="blacklistTitle">AI / 古语漂移词元黑名单</h2>
               <span id="blacklistCount" class="badge">0</span>
             </summary>
             <div class="blacklist-body">
-              <textarea id="blacklistText" rows="5" spellcheck="false" placeholder="comma-separated substrings"></textarea>
+              <textarea id="blacklistText" rows="4" spellcheck="false" placeholder="comma-separated substrings"></textarea>
               <div class="blacklist-footer">
-                <span class="hint" data-i18n="blacklistHint">逗号分隔词根，解码时在 logprobs 层硬屏蔽</span>
+                <span class="hint" data-i18n="blacklistHint">逗号分隔词根，在解码层硬屏蔽</span>
                 <button id="btnResetBlacklist" class="btn-link" data-i18n="restoreDefault">恢复默认</button>
               </div>
             </div>
@@ -249,7 +369,7 @@
         <div class="col-header">
           <div class="col-title-group">
             <h2 data-i18n="outputTitle">改写结果</h2>
-            <span id="outputStats" class="meta-pill">0 词 · 平均 PPL —</span>
+            <span id="outputStats" class="meta-pill">0 词 · —</span>
           </div>
           <div class="col-actions">
             <div class="segmented" role="tablist">
@@ -267,7 +387,7 @@
             <div class="empty-icon">✦</div>
             <p class="empty-title" data-i18n="emptyTitle">准备就绪</p>
             <p class="empty-desc" data-i18n="emptyDesc">
-              在左侧选择「ZeroGPT 反贪心」或「GPTZero 对比解码」模式，粘贴英文文本后点击「开始改写」。生成后可锁定已通过的段落，并对单个段落一键重生成。
+              选择解码引擎与推理后端（Ollama 或 llama.cpp 全词表），可选配跨家族代理或本地 DeBERTa 检测器，粘贴英文文本后点击「开始改写」。
             </p>
           </div>
         </div>

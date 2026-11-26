@@ -1,49 +1,57 @@
 #!/usr/bin/env python3
 """
-Core engine for Local Base-Model Humanizer Studio (Ollama).
+Core engine for Local Base-Model Humanizer Studio (Ollama & llama.cpp).
 
-Supports two complementary local token-level `logprobs` decoding engines:
+Supports two complementary local token-level `logprobs` / full-vocab logits
+decoding engines:
   1. anti_greedy (ZeroGPT Mode):
-     Unaligned local base model with token-level logprobs rank-1 skipping,
-     adaptive plausibility filtering, hard AI-buzzword BPE blacklist,
-     prefix-constrained numeric/citation fact guard, alternating verified
-     0%-AI in-context demos, and fidelity-aware PPL retry.
-  2. contrastive (GPTZero Mode — Contrastive Anti-RLHF Decoding):
-     Same-vocabulary local pair (Base model minus alpha * Instruct model):
-       score(t) = log P_base(t) - alpha * max(log P_instruct(t), i_floor)
-     Upgraded with:
-       - Stage-0 Telegraphic Fact Decomposition (breaks ChatGPT discourse
-         skeletons before decoding so GPTZero 5.0b sees 0% AI Paraphrased).
-       - Strict Prefix-Constrained Numeric & Citation Whitelist (mathematically
-         prevents fabricated numbers, citations, fake figures, or currencies
-         even in the high-entropy Human zone BasePPL >= 6.5 / InstPPL >= 350).
-       - Clamped Instruct logprob floor (fixes -18 infinity bonus explosions)
-         + Adaptive Plausibility Gate (P_base >= beta * max P_base).
-       - Multi-criteria Best-of-N Reranking with factual recall metrics and
-         optional read-only local Instruct Faithfulness Judge (scores drafts
-         without rewriting a single token -> zero AI-detection contamination).
-       - Explicit `num_ctx=2048` KV-cache cap so 8B-Base + 4B-Instruct stay
-         resident together in 12 GB VRAM without per-token model swapping.
+     Unaligned local base model with token-level rank-1 skipping, adaptive
+     plausibility filtering, hard AI-buzzword BPE blacklist, prefix-constrained
+     numeric/citation/entity fact guard, alternating verified 0%-AI in-context
+     demos, and fidelity + burstiness + surrogate-aware Best-of-N retry.
+  2. contrastive (GPTZero Mode — Contrastive Anti-RLHF + Human-Style Decoding):
+     Same-vocabulary local pair (Base model minus alpha(t) * Instruct model):
+       score(t) = log P_base(t | human_demos, notes) - alpha(t) * max(log P_instruct(t), i_floor)
+     Featuring:
+       - Stage-0 Multi-Perspective Telegraphic Decomposition (rotates schemas &
+         shuffles bullets across retries so paragraphs never share one fixed outline).
+       - Human-Style Few-Shot Contrastive Conditioning (Base sees retrieved
+         real-human examples while Instruct stays generic -> pulls toward human
+         style rather than flat high-entropy noise).
+       - Dynamic Sentence-Aware Burstiness Scheduling (`alpha(t)` alternates
+         crisp low-alpha short sentences with richer higher-alpha complex sentences,
+         relaxing penalty on grammatical glue and protected factual terms).
+       - Strict Prefix-Constrained Fact Guard protecting numbers, citations,
+         authors, acronyms, and proper nouns, plus active `CONTRASTIVE_BANNED_SUBSTRS`
+         filtering (blocking both AI clichés and archaic contrastive drift).
+       - Dual Inference Backends: zero-dependency persistent keep-alive Ollama HTTP
+         OR exact full-vocabulary `llama-cpp-python` (GGUF) with 0 Top-20 cliff.
+       - Multi-Signal Local Surrogate Reranking: Linguistic Burstiness + 3-gram
+         anti-paraphrase overlap + unconditional cross-family Ollama GLTR probe
+         + exact `llama.cpp` Binoculars + optional local DeBERTa/RoBERTa neural
+         AI detector + read-only Instruct faithfulness judge.
 """
 
 import argparse
-import json
 import math
 import random
 import re
 import sys
 import threading
 import time
-import urllib.request
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-DEFAULT_OLLAMA_BASE = "http://127.0.0.1:11434"
+import backends
+import human_demos
+import surrogates
+
+DEFAULT_OLLAMA_BASE = backends.DEFAULT_OLLAMA_BASE
 DEFAULT_MODEL = "lab-qwen3-4b-base:latest"
 DEFAULT_INSTRUCT_MODEL = "lab-qwen3-4b:latest"
 DEFAULT_LENGTH_RATIO = 1.0
-DEFAULT_NUM_CTX = 2048
-DEFAULT_I_FLOOR = -9.5
-DEFAULT_BETA = 0.025
+DEFAULT_NUM_CTX = backends.DEFAULT_NUM_CTX
+DEFAULT_I_FLOOR = -11.5
+DEFAULT_BETA = 0.020
 
 DEFAULT_BANNED_SUBSTRS = [
     "utiliz", "employ", "leverag", "demonstrat", "illustrat", "highlight",
@@ -62,13 +70,22 @@ DEFAULT_BANNED_SUBSTRS = [
     "important", "topic", "variety", "discuss", "solve", "issues", "further",
 ]
 
-# Light, precision-focused ban list for Contrastive mode (blocks extreme AI clichés & archaic drift)
+# Precision-focused ban list enforced in Contrastive mode: blocks extreme AI clichés
+# AND archaic/legalese contrastive drift tokens that Base scores higher than Instruct.
 CONTRASTIVE_BANNED_SUBSTRS = [
     "utiliz", "leverag", "delve", "tapestry", "testament", "multifaceted",
     "pivotal", "paramount", "cutting-edge", "underscor", "highlight",
     "furthermore", "moreover", "additionally", "thereby", "in-depth",
-    "summary", "herein", "therein", "thereof", "wherein", "whilst", "—", "–",
+    "summary", "herein", "therein", "thereof", "wherein", "whilst",
+    "heretofore", "aforementioned", "notwithstanding", "—", "–",
 ]
+
+# Cliché paragraph openings blocked during the first few words of free-start generation
+OPENING_CLICHE_PREFIXES = (
+    "recent studies", "in recent years", "this study", "the study",
+    "it is worth noting", "in summary", "overall,", "notably,",
+    "furthermore,", "moreover,", "additionally,", "in conclusion",
+)
 
 DEMO_A = """Notes:
 Chang et al. [6] report a campus electricity-data platform where Hadoop handles collection and storage, Hive handles warehousing, Spark does ETL, and Impala handles queries. Preview reports query and ETL tests across different processing-node counts. Neither [5] nor [6] is direct PV or wind forecasting evidence.
@@ -95,43 +112,79 @@ STRUCTURAL_HALLUC_WORDS = (
     "figure", "fig", "table", "appendix", "chapter", "equation", "column", "page",
 )
 
+# Common grammatical glue words relaxed under Dynamic Burstiness scheduling
+_GLUE_WORDS: Set[str] = {
+    "the", "a", "an", "of", "in", "on", "to", "for", "with", "by", "at", "from",
+    "into", "as", "that", "which", "who", "and", "or", "but", "is", "are", "was",
+    "were", "be", "been", "being", "has", "have", "had", "this", "these", "those",
+    "it", "its", "their", "they", "we", "our", "than", "not", "no", "per",
+}
+
+_PROTECTED_STOPWORDS: Set[str] = {
+    "the", "this", "these", "those", "both", "each", "some", "many", "most",
+    "data", "model", "models", "study", "studies", "paper", "method", "methods",
+    "result", "results", "system", "table", "figure", "section", "however",
+    "although", "because", "while", "where", "when", "after", "before", "across",
+    "between", "within", "under", "over", "during", "through", "recent", "future",
+}
+
+# Diverse Stage-0 telegraphic extraction perspectives (breaks fixed Study/Method/Result template!)
+NOTE_EXTRACTION_SCHEMAS: List[str] = [
+    (
+        "Break the paragraph below into 4-5 ultra-terse, unlabelled factual bullet fragments (NO headers like 'Study:' or 'Method:').\n"
+        "Order: concrete quantitative outcomes/comparisons FIRST, technical setup/sample in the middle, caveats or broader context LAST.\n"
+        "Strict rules:\n"
+        "1. Preserve EVERY exact number, percentage, year, unit, comparison direction (higher/lower/fewer/faster), author name, technical term, and citation [k].\n"
+        "2. Use clipped fragments rather than polished prose. Do NOT add new numbers or AI buzzwords (demonstrated, highlighted, crucial, significantly, furthermore, however, thereby, underscoring, robust, comprehensive).\n"
+        "3. Output ONLY the short fragment lines."
+    ),
+    (
+        "Extract 4-5 terse scratchpad fragments from the paragraph below (plain lines, no labels).\n"
+        "Order: start with the main contrast, trade-off, or limitation, then state the system/dataset/method and exact reported figures.\n"
+        "Strict rules:\n"
+        "1. Keep EVERY exact number, percentage, year, unit, comparison direction, author name, acronym, and citation [k].\n"
+        "2. Write clipped telegraphic phrases, NOT full sentences. Never invent numbers or use AI transition words (furthermore, moreover, notably, thereby, crucial, pivotal, underscoring, demonstrating).\n"
+        "3. Output ONLY the fragment lines."
+    ),
+    (
+        "Distill the paragraph below into 4-5 compact factual notes (no field labels, no prose transitions).\n"
+        "Order: concrete experimental setup / cohort / dataset / authors first, observed measurements second, boundary condition or gap last.\n"
+        "Strict rules:\n"
+        "1. Keep EVERY exact number, unit, year, comparison direction, author name, technical term, and citation [k].\n"
+        "2. Avoid complete academic sentences and ban AI clichés (utilize, leverage, demonstrate, highlight, significantly, effectively, framework, landscape, multifaceted).\n"
+        "3. Output ONLY the short note lines."
+    ),
+    (
+        "Compress the paragraph below into 4-5 raw research scratch notes (semicolon-separated phrases, no labels).\n"
+        "Order: open with the specific question or technical challenge addressed, followed immediately by cited evidence and exact numerical values.\n"
+        "Strict rules:\n"
+        "1. Retain EVERY exact number, percentage, year, unit, comparison direction, author name, domain term, and citation [k].\n"
+        "2. Keep fragments terse and unpolished; zero invented numbers and zero AI filler verbs (demonstrated, underscored, highlighted, facilitated, enabling, ensuring).\n"
+        "3. Output ONLY the note lines."
+    ),
+    (
+        "Convert the paragraph below into 4-5 concise, non-chronological technical note lines (no labels like 'Result:' or 'Context:').\n"
+        "Order: lead with the strongest empirical finding or cited benchmark, then attach methodology details and scope limits.\n"
+        "Strict rules:\n"
+        "1. Preserve EVERY exact number, percentage, year, unit, direction of effect, author name, acronym, and citation [k].\n"
+        "2. Do NOT write polished sentences, do NOT introduce numbers absent from the text, and avoid AI buzzwords (crucial, pivotal, paramount, furthermore, moreover, thereby, robust, comprehensive).\n"
+        "3. Output ONLY the note lines."
+    ),
+]
+
 
 def normalize_ollama_base(url: str) -> str:
-    u = (url or DEFAULT_OLLAMA_BASE).strip().rstrip("/")
-    if u.endswith("/api/generate"):
-        u = u[: -len("/api/generate")]
-    elif u.endswith("/api/tags"):
-        u = u[: -len("/api/tags")]
-    return u
+    return backends.normalize_ollama_base(url)
 
 
 def list_ollama_models(ollama_base: str = DEFAULT_OLLAMA_BASE, timeout: float = 5.0) -> Tuple[bool, List[Dict], str]:
-    base = normalize_ollama_base(ollama_base)
-    try:
-        req = urllib.request.Request(f"{base}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            models = data.get("models", [])
-            result = [
-                {
-                    "name": m.get("name", ""),
-                    "size": m.get("size", 0),
-                    "is_base": "base" in m.get("name", "").lower(),
-                }
-                for m in models
-                if m.get("name")
-            ]
-            # Sort base models first (larger base models first, then alphabetically)
-            result.sort(key=lambda x: (not x["is_base"], -x["size"] if x["is_base"] else 0, x["name"]))
-            return True, result, ""
-    except Exception as exc:
-        return False, [], str(exc)
+    return backends.OLLAMA_CLIENT.list_models(ollama_base, timeout=timeout)
 
 
 def format_instruct_prompt(instruct_model: str, user_msg: str, assistant_prefix: str = "") -> str:
-    """Format a single-turn chat prompt matching the target Ollama Instruct model family."""
+    """Format a single-turn chat prompt matching the target Instruct model family."""
     m = (instruct_model or "").lower()
-    if "qwen3" in m:
+    if "qwen3" in m or "qwen-3" in m:
         return (
             f"<|im_start|>user\n{user_msg}<|im_end|>\n"
             f"<|im_start|>assistant\n<think>\n\n</think>\n{assistant_prefix}"
@@ -141,12 +194,14 @@ def format_instruct_prompt(instruct_model: str, user_msg: str, assistant_prefix:
             f"<|im_start|>user\n{user_msg}<|im_end|>\n"
             f"<|im_start|>assistant\n{assistant_prefix}"
         )
-    if "llama" in m:
+    if "llama-3" in m or "llama3" in m or "llama" in m:
         return (
             f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
             f"{user_msg}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
             f"{assistant_prefix}"
         )
+    if "mistral" in m or "mixtral" in m:
+        return f"[INST] {user_msg} [/INST]{assistant_prefix}"
     if "gemma" in m:
         return (
             f"<start_of_turn>user\n{user_msg}<end_of_turn>\n"
@@ -166,27 +221,16 @@ def ollama_generate_raw(
     timeout: float = 90.0,
     keep_alive: str = "10m",
 ) -> str:
-    url = f"{normalize_ollama_base(ollama_base)}/api/generate"
-    payload = {
-        "model": model,
-        "prompt": raw_prompt,
-        "raw": True,
-        "stream": False,
-        "keep_alive": keep_alive,
-        "options": {
-            "num_predict": num_predict,
-            "temperature": temperature,
-            "num_ctx": num_ctx,
-        },
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+    return backends.OLLAMA_CLIENT.generate_raw(
+        ollama_base,
+        model,
+        raw_prompt,
+        num_predict=num_predict,
+        temperature=temperature,
+        num_ctx=num_ctx,
+        timeout=timeout,
+        keep_alive=keep_alive,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        d = json.loads(resp.read().decode("utf-8"))
-        return (d.get("response") or "").strip()
 
 
 def is_heading(line: str) -> bool:
@@ -269,10 +313,13 @@ def chunk_paragraph(para: str, max_chunk_words: int = 160) -> List[str]:
     return chunks
 
 
-def _chunk_demo_blacklist(chunk_text: str) -> List[str]:
+def _chunk_demo_blacklist(chunk_text: str, extra_leak_words: Optional[Sequence[str]] = None) -> List[str]:
     """Return demo-specific entities not present in chunk_text so they can never leak."""
     low = chunk_text.lower()
-    return [w for w in DEMO_LEAK_WORDS if w not in low]
+    pool = set(DEMO_LEAK_WORDS)
+    if extra_leak_words:
+        pool.update(w.lower() for w in extra_leak_words if w)
+    return [w for w in sorted(pool) if w not in low]
 
 
 def _causes_demo_leak_or_repeat(cur_text: str, tok: str, demo_ban: List[str]) -> bool:
@@ -297,13 +344,21 @@ def _causes_banned_bpe(cur_text: str, tok: str, banned_substrs: List[str]) -> bo
     t_low = tok.lower().strip()
     if t_low and any(b in t_low for b in banned_substrs if b):
         return True
-    tail = (cur_text[-20:] + tok).lower()
+    tail = (cur_text[-24:] + tok).lower()
     m = re.search(r"[a-z\-]+$", tail)
     if m:
         w = m.group(0)
         if any(b in w for b in banned_substrs if b):
             return True
     return False
+
+
+def _causes_opening_cliche(cur_text: str, tok: str) -> bool:
+    """Block formulaic AI paragraph openings during the first ~4 words of generation."""
+    combined = re.sub(r"\s+", " ", (cur_text + tok)).strip().lower()
+    if len(combined) > 36:
+        return False
+    return any(combined.startswith(prefix) for prefix in OPENING_CLICHE_PREFIXES)
 
 
 def is_banned(tok: str, banned_substrs: List[str]) -> bool:
@@ -318,7 +373,7 @@ def is_clean_ascii(tok: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Strict Numeric / Citation Fact Guard & Fidelity Metrics
+# Strict Numeric / Citation / Entity Fact Guard & Fidelity Metrics
 # ---------------------------------------------------------------------------
 
 def _expand_citation_groups(text: str) -> Set[str]:
@@ -328,7 +383,6 @@ def _expand_citation_groups(text: str) -> Set[str]:
         inner = m.group(1)
         for num in re.findall(r"\d+", inner):
             ids.add(num)
-    # Also handle [4]-[6] range endpoints (individual bracketed numbers already caught above)
     return ids
 
 
@@ -337,7 +391,6 @@ def extract_facts_signature(text: str) -> Dict[str, Set[str]]:
     cite_nums = _expand_citation_groups(text)
     cites = {f"[{n}]" for n in cite_nums}
 
-    # Remove citation brackets before extracting factual numbers
     no_cites = re.sub(r"\[\d+(?:\s*[,;\-–]\s*\d+)*\]", " ", text)
     raw_nums = re.findall(r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", no_cites)
     nums: Set[str] = set()
@@ -347,9 +400,7 @@ def extract_facts_signature(text: str) -> Dict[str, Set[str]]:
             nums.add(rn.replace(",", ""))
 
     authors = set(re.findall(r"\b([A-Z][a-zA-Z\-]{2,})\s+(?:et\s+al\.|and\s+[A-Z][a-zA-Z\-]{2,})", text))
-    # Also capture the second author in "Weber and Klein"
     for m in re.finditer(r"\b([A-Z][a-zA-Z\-]{2,})\s+and\s+([A-Z][a-zA-Z\-]{2,})\b", text):
-        # Ignore sentence-initial common words like "Data and Models"
         a1, a2 = m.group(1), m.group(2)
         if a1.lower() not in {"the", "this", "these", "both", "data", "wind", "solar", "cement", "steel"}:
             authors.add(a1)
@@ -378,9 +429,9 @@ def extract_facts_signature(text: str) -> Dict[str, Set[str]]:
 
 def build_fact_guard(source_text: str) -> Dict:
     """
-    Precompute prefix tries for strict prefix-constrained numeric & citation decoding.
-    Prevents fabricating numbers (e.g. '+230 EUR/tc', '9 pp', '2% GDP') or citations ('[7]')
-    even under high-entropy BasePPL >= 6.5 decoding.
+    Precompute prefix tries for strict prefix-constrained numeric & citation decoding,
+    plus protected entity/acronym/author prefix sets so Contrastive Decoding does not
+    penalize accurate domain terminology.
     """
     sig = extract_facts_signature(source_text)
     allowed_nums = set(sig["nums"])
@@ -394,6 +445,18 @@ def build_fact_guard(source_text: str) -> Dict:
     for cn in allowed_cite_nums:
         for i in range(1, len(cn) + 1):
             cite_prefixes.add(cn[:i])
+
+    # Protected authors, acronyms, and non-generic proper nouns (and their 3+ char BPE prefixes)
+    protected_terms: Set[str] = set()
+    for term in sig["proper"]:
+        clean_t = re.sub(r"[^a-z0-9\-]", "", term.lower())
+        if len(clean_t) >= 2 and clean_t not in _PROTECTED_STOPWORDS:
+            protected_terms.add(clean_t)
+    protected_prefixes: Set[str] = set()
+    for term in protected_terms:
+        min_p = 2 if len(term) <= 3 else 3
+        for i in range(min_p, len(term) + 1):
+            protected_prefixes.add(term[:i])
 
     low = source_text.lower()
     block_dollar = ("$" not in source_text) and ("dollar" not in low) and ("usd" not in low)
@@ -409,6 +472,8 @@ def build_fact_guard(source_text: str) -> Dict:
         "num_prefixes": num_prefixes,
         "allowed_cite_nums": allowed_cite_nums,
         "cite_prefixes": cite_prefixes,
+        "protected_terms": protected_terms,
+        "protected_prefixes": protected_prefixes,
         "block_dollar": block_dollar,
         "block_euro_sym": block_euro_sym,
         "block_gdp": block_gdp,
@@ -437,14 +502,11 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
         return True
     if guard["blocked_struct"] and (tl in guard["blocked_struct"] or tail_word in guard["blocked_struct"]):
         return True
-    # Block fabricated page references like '(p.' or ' p.' when not in source
     if re.search(r"[\(\s]p\.$", (cur_text[-6:] + tok).lower()):
         return True
-    # Block fabricated slash-unit jargon like '/tc', '/cap' unless present in source
     if "/" in tok and re.search(r"/[a-z]{2,}", tl):
         if tl not in guard["sig"]["proper"]:
             return True
-    # Block comma immediately after a complete number if next token starts a digit (prevents '14,' + '200')
     if re.search(r"\d,$", cur_text) and tok and tok[0].isdigit():
         m_prev = re.search(r"(\d+(?:,\d+)*,)$", cur_text)
         if m_prev:
@@ -458,13 +520,10 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
         inner = m_open_cite.group(1)
         m_last = re.search(r"(\d*)$", inner)
         cur_cid = m_last.group(1) if m_last else ""
-        # Block letters inside numeric citation brackets
         if re.search(r"[A-Za-z]", tok):
             return True
         if not guard["allowed_cite_nums"]:
             return True
-        # Analyze how `tok` continues the open bracket
-        test_inner = inner + tok
         if "]" in tok:
             before_close = tok.split("]", 1)[0]
             cand_id = cur_cid + re.sub(r"[^\d]", "", before_close)
@@ -472,7 +531,6 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
                 return True
             return False
         if any(ch.isdigit() for ch in tok):
-            # Could contain separator + digit, or pure digit continuation
             segs = re.split(r"[,;\-–\s]+", (cur_cid + tok).strip())
             for idx_s, seg in enumerate(segs):
                 if not seg:
@@ -484,7 +542,6 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
                     if seg not in guard["cite_prefixes"]:
                         return True
             return False
-        # Punctuation like ',', '-', ' ' inside bracket: only valid after a complete citation ID
         if cur_cid and cur_cid not in guard["allowed_cite_nums"]:
             return True
         return False
@@ -492,7 +549,6 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
     # 3. Starting a new '[' citation when source has no citations
     if "[" in tok and not guard["allowed_cite_nums"]:
         return True
-    # If tok both opens '[' and includes digits (e.g. ' [7' or '[15]'), validate immediately
     if "[" in tok:
         after_br = tok.split("[", 1)[1]
         if after_br:
@@ -517,13 +573,10 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
         cur_base = cur_num_clean[:-1] if cur_ends_dot else cur_num_clean
 
         if tok and (tok[0].isdigit() or (tok[0] in ".," and not cur_ends_dot)):
-            # Extending the current numeric token
-            # Allow a trailing sentence period '.' right after a COMPLETE allowed number (e.g., "BraTS 2023.")
             if tok[0] == "." and cur_num_clean in guard["allowed_nums"]:
                 rest = tok[1:]
                 if not rest or not rest[0].isdigit():
                     return False
-            # Allow a trailing comma ',' after a COMPLETE allowed number (e.g., "in 2020,")
             if tok[0] == "," and cur_num_clean in guard["allowed_nums"]:
                 rest = tok[1:]
                 if not rest or not rest[0].isdigit():
@@ -536,7 +589,6 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
             ext_num = m_ext.group(1)
             ext_clean = ext_num.replace(",", "")
             remainder = m_ext.group(2)
-            # If tok terminated the number with non-digit characters (e.g. '4%'), ext_clean must be complete
             if remainder:
                 check_val = ext_clean[:-1] if ext_clean.endswith(".") else ext_clean
                 if check_val not in guard["allowed_nums"]:
@@ -546,27 +598,20 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
                     return True
             return False
         else:
-            # `tok` terminates the current number (e.g., space, '%', letter)
             if cur_ends_dot:
-                # Sentence period after complete number is valid (e.g. '2023.' + ' The'),
-                # but incomplete decimal like '91.' + ' The' is INVALID!
                 if cur_base not in guard["allowed_nums"]:
                     return True
             else:
                 if cur_num_clean not in guard["allowed_nums"]:
                     return True
-            # Still fall through below in case `tok` itself starts a SECOND number (rare)
 
     # 4b. Block fabricated '28x28' / '28GB' dimensions or excessive reuse of an allowed number
     if re.search(r"\d$", cur_text) and tok and tok[0].lower() in ("x", "g", "m", "k") and not re.search(r"\b\d+[xgmk]", guard.get("source_low", "")):
-        # Allow '1.8x' if source has 'times' or 'x', block '28x28' or '28GB'
         if not (tok.lower().startswith("x") and ("times" in guard.get("source_low", "") or "x" in guard.get("source_low", ""))):
             return True
-    # Prevent reusing the exact same allowed number > 2 times in a single paragraph (stops '28x28x28 ... 28GB')
     if any(ch.isdigit() for ch in tok):
         m_prev_d = re.search(r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?)$", cur_text)
         if not m_prev_d:
-            # Starting a fresh number: check if every matching allowed_num has already been used >= 2 times
             first_d = re.search(r"(\d+(?:\.\d*)?)", tok)
             if first_d:
                 pref = first_d.group(1)
@@ -580,7 +625,6 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
     if any(ch.isdigit() for ch in tok):
         if not guard["allowed_nums"]:
             return True
-        # Inspect every numeric segment inside `tok`
         for m_d in re.finditer(r"(\d+(?:,\d{3})*(?:\.\d*)?)", tok):
             seg = m_d.group(1).replace(",", "")
             ends_at_tok_end = (m_d.end() == len(tok))
@@ -596,11 +640,31 @@ def _violates_fact_guard(cur_text: str, tok: str, guard: Dict) -> bool:
 
 
 def _is_active_fact_token(cur_text: str, tok: str, guard: Dict) -> bool:
-    """True when `tok` is continuing/writing a whitelisted digit, citation, or source proper noun."""
+    """
+    True when `tok` is continuing/writing a whitelisted digit, citation,
+    or protected source author / acronym / proper noun (including BPE prefixes).
+    """
     if re.search(r"\[\d*$", cur_text) or re.search(r"\d\.?$", cur_text):
         return True
     if any(ch.isdigit() for ch in tok) or tok.strip() in ("[", "]", "%"):
         return True
+
+    protected_terms = guard.get("protected_terms")
+    protected_prefixes = guard.get("protected_prefixes")
+    if not protected_terms:
+        return False
+
+    # Check assembled trailing word (handles BPE-split proper nouns like " Bra" + "TS", " Map" + "Reduce")
+    m_tail = re.search(r"([A-Za-z][A-Za-z0-9\-]*)$", (cur_text[-20:] + tok))
+    if m_tail:
+        word_raw = m_tail.group(1)
+        word_low = word_raw.lower()
+        if word_low in protected_terms:
+            return True
+        if len(word_low) >= 3 and word_low in protected_prefixes:
+            # Avoid false triggers on lowercase everyday words unless they match an exact capitalized/acronym prefix
+            if word_raw[0].isupper() or word_low in protected_terms:
+                return True
     return False
 
 
@@ -672,45 +736,60 @@ def extract_telegraphic_notes(
     ollama_base: str = DEFAULT_OLLAMA_BASE,
     instruct_model: str = DEFAULT_INSTRUCT_MODEL,
     num_ctx: int = DEFAULT_NUM_CTX,
+    variant_idx: int = 0,
+    shuffle_seed: Optional[int] = None,
+    backend: str = "ollama",
+    llama_llm: Any = None,
 ) -> str:
     """
-    Stage-0 Anti-Paraphrase Decomposition:
-    Converts polished AI prose into terse, unordered/results-first telegraphic notes
-    with ZERO AI transition verbs or discourse templates, while deterministically
-    guaranteeing zero dropped numbers or citations.
+    Stage-0 Multi-Perspective Anti-Paraphrase Decomposition:
+    Converts polished AI prose into terse, unlabelled telegraphic fragments
+    using rotating organizational schemas (preventing fixed Study->Method->Result
+    fingerprints across paragraphs) while deterministically guaranteeing zero
+    dropped numbers or citations.
     """
-    user_msg = (
-        "Convert the paragraph below into 4-5 ultra-terse telegraphic key-value notes "
-        "(e.g. 'Study: ...', 'Method: ...', 'Result: ...', 'Detail: ...', 'Context: ...').\n"
-        "Strict rules:\n"
-        "1. Put concrete study/authors/dataset/numbers FIRST, and general background LAST.\n"
-        "2. Keep EVERY exact number, percentage, year, unit, comparison direction (e.g. higher/fewer/over), author name, technical term, sector/material, and citation [k].\n"
-        "3. Do NOT write full prose sentences, do NOT add new numbers (e.g. do not write '3D' unless in source), and NEVER use AI verbs/buzzwords like 'demonstrated', 'highlighted', 'crucial', 'significantly', 'furthermore', 'however', 'thereby', 'underscoring', 'mechanisms', 'heterogeneous'.\n"
-        "4. Output ONLY the short note lines.\n\n"
-        f"{source_para.strip()}"
-    )
+    schema = NOTE_EXTRACTION_SCHEMAS[variant_idx % len(NOTE_EXTRACTION_SCHEMAS)]
+    user_msg = f"{schema}\n\n{source_para.strip()}"
     prompt = format_instruct_prompt(instruct_model, user_msg)
+    temp = 0.0 if variant_idx == 0 else 0.25
+
     try:
-        raw = ollama_generate_raw(
-            ollama_base,
-            instruct_model,
-            prompt,
-            num_predict=240,
-            temperature=0.0,
-            num_ctx=num_ctx,
-            timeout=60.0,
-        )
+        if backend == "llama_cpp" and llama_llm is not None:
+            raw = backends.LLAMA_CPP_MANAGER.generate_raw(
+                llama_llm,
+                prompt,
+                num_predict=240,
+                temperature=temp,
+            )
+        else:
+            raw = ollama_generate_raw(
+                ollama_base,
+                instruct_model,
+                prompt,
+                num_predict=240,
+                temperature=temp,
+                num_ctx=num_ctx,
+                timeout=60.0,
+            )
     except Exception:
         return source_para.strip()
 
-    # Clean up any markdown bullets or stray prose headers
+    # Strip bullets AND accidental 'Study:'/'Method:' labels so Base doesn't copy slot order
     lines = []
     for ln in raw.splitlines():
-        s = ln.strip().lstrip("-*• ").strip()
+        s = ln.strip().lstrip("-*•0123456789.) ").strip()
+        s = re.sub(r"^(?:Study|Method|Result|Detail|Context|Finding|Setup|Limitation|Note)\s*:\s*", "", s, flags=re.IGNORECASE)
         if s and len(s) >= 8:
             lines.append(s)
     if len(lines) < 2:
         return source_para.strip()
+
+    if shuffle_seed is not None and len(lines) >= 3:
+        rng = random.Random(shuffle_seed)
+        # Rotate/shuffle note order across retries to break linear bullet-stitching
+        perm = list(lines)
+        rng.shuffle(perm)
+        lines = perm
 
     notes = "\n".join(lines)
 
@@ -737,6 +816,8 @@ def judge_faithfulness(
     ollama_base: str = DEFAULT_OLLAMA_BASE,
     instruct_model: str = DEFAULT_INSTRUCT_MODEL,
     num_ctx: int = DEFAULT_NUM_CTX,
+    backend: str = "ollama",
+    llama_llm: Any = None,
 ) -> Optional[float]:
     """
     Read-only Local Instruct Faithfulness & Coherence Judge (0.0 to 10.0).
@@ -753,15 +834,23 @@ def judge_faithfulness(
     )
     prompt = format_instruct_prompt(instruct_model, user_msg)
     try:
-        out = ollama_generate_raw(
-            ollama_base,
-            instruct_model,
-            prompt,
-            num_predict=8,
-            temperature=0.0,
-            num_ctx=num_ctx,
-            timeout=30.0,
-        )
+        if backend == "llama_cpp" and llama_llm is not None:
+            out = backends.LLAMA_CPP_MANAGER.generate_raw(
+                llama_llm,
+                prompt,
+                num_predict=8,
+                temperature=0.0,
+            )
+        else:
+            out = ollama_generate_raw(
+                ollama_base,
+                instruct_model,
+                prompt,
+                num_predict=8,
+                temperature=0.0,
+                num_ctx=num_ctx,
+                timeout=30.0,
+            )
         m = re.search(r"\b(10|[0-9])\b", out)
         if m:
             return float(int(m.group(1)))
@@ -779,29 +868,93 @@ def next_token_logprobs(
     keep_alive: str = "10m",
     num_ctx: int = DEFAULT_NUM_CTX,
 ) -> Tuple[Optional[str], List[Tuple[str, float]]]:
-    url = f"{normalize_ollama_base(ollama_base)}/api/generate"
-    payload = {
-        "model": model,
-        "prompt": raw_prompt,
-        "raw": True,
-        "stream": False,
-        "keep_alive": keep_alive,
-        "logprobs": True,
-        "top_logprobs": top_k,
-        "options": {"num_predict": 1, "temperature": 0.0, "num_ctx": num_ctx},
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+    return backends.OLLAMA_CLIENT.next_token_logprobs(
+        ollama_base,
+        model,
+        raw_prompt,
+        top_k=top_k,
+        timeout=timeout,
+        keep_alive=keep_alive,
+        num_ctx=num_ctx,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        d = json.loads(resp.read().decode("utf-8"))
-        lps = d.get("logprobs", [])
-        if not lps:
-            return None, []
-        top = lps[0].get("top_logprobs", [])
-        return lps[0].get("token", ""), [(x["token"], x["logprob"]) for x in top]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Sentence-Aware Burstiness Scheduler (Step 1)
+# ---------------------------------------------------------------------------
+
+class BurstinessScheduler:
+    """
+    Replaces flat constant `alpha` with sentence-rhythm-aware dynamic modulation:
+      - Alternates crisp short sentences (low alpha -> idiomatic low-PPL prose)
+        with multi-clause long sentences (higher alpha on verbs/pivots -> high-PPL
+        human turns), generating authentic human sentence-length & PPL burstiness.
+      - Relaxes `alpha` on grammatical glue words so contrastive decoding shifts
+        lexical/rhetorical choices instead of breaking syntax.
+    """
+
+    PLANS: List[List[Tuple[str, int]]] = [
+        [("short", 12), ("long", 30), ("medium", 18), ("short", 11), ("long", 28), ("medium", 17)],
+        [("medium", 18), ("short", 11), ("long", 32), ("short", 12), ("medium", 19), ("long", 27)],
+        [("long", 29), ("short", 10), ("medium", 19), ("long", 28), ("short", 12), ("medium", 18)],
+        [("short", 11), ("medium", 18), ("short", 12), ("long", 33), ("medium", 17), ("short", 11)],
+    ]
+
+    def __init__(self, seed: int = 0, enabled: bool = True):
+        self.enabled = enabled
+        self.plan = self.PLANS[abs(int(seed)) % len(self.PLANS)]
+
+    def slot(self, sent_idx: int) -> Tuple[str, int]:
+        return self.plan[sent_idx % len(self.plan)]
+
+    def modulate(
+        self,
+        base_alpha: float,
+        tok: str,
+        *,
+        sent_idx: int,
+        words_in_sent: int,
+        in_fact: bool,
+    ) -> Tuple[float, float]:
+        """
+        Return `(effective_alpha, logit_nudge)` for candidate `tok`.
+        """
+        if in_fact:
+            return base_alpha * 0.20, 0.0
+        if not self.enabled:
+            return base_alpha, 0.0
+
+        kind, target_w = self.slot(sent_idx)
+        stripped = tok.strip()
+        low = stripped.lower()
+
+        # 1. Sentence-rhythm alpha envelope
+        if kind == "short":
+            mult = 0.68 if words_in_sent >= 2 else 0.82
+        elif kind == "long":
+            # Higher contrastive push at sentence pivots & mid-clause transitions
+            if words_in_sent <= 2 or (9 <= words_in_sent <= 18):
+                mult = 1.22
+            else:
+                mult = 1.06
+        else:
+            mult = 1.00
+
+        # 2. Relax contrastive penalty on grammatical glue / punctuation
+        if low in _GLUE_WORDS or (stripped and all(not ch.isalnum() for ch in stripped)):
+            mult *= 0.60
+
+        eff_alpha = max(0.08, min(1.75, base_alpha * mult))
+
+        # 3. Gentle sentence-length cadence nudge on period token '.'
+        nudge = 0.0
+        if stripped == "." or tok == ".":
+            if kind == "short" and words_in_sent >= max(8, target_w - 2):
+                nudge = 0.55
+            elif kind == "long" and words_in_sent < 12:
+                nudge = -0.45
+
+        return eff_alpha, nudge
 
 
 def make_seed_start(para: str, idx: int) -> str:
@@ -866,33 +1019,33 @@ def _ends_clean_sentence(text: str) -> bool:
 CONTRASTIVE_REGISTERS = [
     (
         "Notes from reading research papers:\n{notes}\n\n"
-        "Plain factual paragraph (complete sentences, direct, exact figures and citations):\n{anchor}"
+        "Plain factual paragraph (varied sentence lengths, direct statements, exact figures and citations):\n{anchor}"
     ),
     (
         "Literature notes:\n{notes}\n\n"
-        "Direct plain-English technical paragraph (factual, exact numbers, complete sentences):\n{anchor}"
+        "Direct plain-English technical paragraph (concrete phrasing, exact numbers, natural rhythm):\n{anchor}"
     ),
     (
         "Summary notes from empirical studies:\n{notes}\n\n"
-        "Plain academic draft paragraph (straightforward verbs, varied sentence lengths):\n{anchor}"
+        "Unpolished academic draft paragraph (mix of short and complex sentences, exact facts):\n{anchor}"
     ),
     (
         "Review notes:\n{notes}\n\n"
-        "Concrete plain-prose paragraph (active voice, clear accurate facts):\n{anchor}"
+        "Concrete plain-prose paragraph (active voice where natural, accurate reported values):\n{anchor}"
     ),
     (
         "Paper scratch notes:\n{notes}\n\n"
-        "Unpolished academic prose paragraph (direct statements, exact facts, complete sentences):\n{anchor}"
+        "Direct research prose paragraph (plain verbs, varied cadence, complete sentences):\n{anchor}"
     ),
     (
         "Reading notes on published studies:\n{notes}\n\n"
-        "Plain factual paragraph (direct comparisons, exact reported values):\n{anchor}"
+        "Plain factual paragraph (exact comparisons, no filler transitions, varied sentence lengths):\n{anchor}"
     ),
 ]
 
 
 def _extract_topic_phrase(para: str) -> str:
-    """Extract a concise 2-3 word domain phrase from para to anchor Contrastive mode factually."""
+    """Extract a concise 2-word domain phrase from para to anchor Contrastive mode factually."""
     sents = split_sentences(para.strip())
     head = " ".join(sents[:2]) if sents else para
     stop = {
@@ -906,12 +1059,23 @@ def _extract_topic_phrase(para: str) -> str:
         for w in head.split()
         if len(w.strip(".,;:()[]\"'")) >= 4 and w.strip(".,;:()[]\"'").lower() not in stop and not w.strip(".,;:()[]\"'").isdigit()
     ]
-    return " ".join(cands[:2]) if cands else "this study"
+    return " ".join(cands[:2]) if cands else "this setup"
 
 
 def make_contrastive_anchor(para: str, idx: int) -> str:
-    """Create a varied, topic-grounded 3-6 word factual anchor (zero hallucination, zero repetition)."""
+    """
+    Create a non-formulaic opening anchor for Contrastive mode.
+
+    - Always preserves explicit inline lead-in headings (e.g. `RQ1. ...`, `Edge forecasting.`).
+    - On half of paragraphs, returns an empty string `""` (free start) so human-demo
+      conditioned Base models open organically without a detectable 6-template prefix pattern!
+    - On the other half, uses natural varied factual openers (direct author subject, etc.).
+    """
     stripped = para.strip()
+    lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{2,45}\.)\s+(.+)$", stripped)
+    if lead_m and not lead_m.group(1).lower().endswith("et al."):
+        return f"{lead_m.group(1)} "
+
     sents = split_sentences(stripped)
     head = " ".join(sents[:2]) if sents else stripped
     auth_m = re.search(r"\b([A-Z][A-Za-z\-]+(?:\s+et\s+al\.|\s+and\s+[A-Z][A-Za-z\-]+))\b", head)
@@ -922,31 +1086,21 @@ def make_contrastive_anchor(para: str, idx: int) -> str:
         if c not in unique_cites:
             unique_cites.append(c)
 
-    lead_m = re.match(r"^((?:[A-Z]{1,4}\d+\.\s+)?[A-Z][A-Za-z0-9\-\s]{2,40})\.", stripped)
-    has_lead = bool(lead_m and not lead_m.group(1).lower().endswith("et al"))
-    topic = _extract_topic_phrase(stripped)
-
-    bucket = idx % 6
-    if bucket == 0 and auth_m and unique_cites:
-        return f"In {unique_cites[0]}, {auth_m.group(1)}"
-    if bucket == 1 and unique_cites:
-        return f"On {topic} in {unique_cites[0]},"
-    if bucket == 2 and has_lead:
-        return f"{lead_m.group(1)}. For this setup,"
+    bucket = idx % 8
+    # Free-start buckets (50% of paragraphs) eliminate cross-paragraph opener fingerprints
+    if bucket in (0, 2, 4, 6):
+        return ""
+    if bucket == 1 and auth_m and unique_cites:
+        return f"{auth_m.group(1)} {unique_cites[0]}"
     if bucket == 3 and auth_m:
-        return f"The {topic} work by {auth_m.group(1)}"
-    if bucket == 4 and unique_cites:
-        return f"Looking at {topic} ({unique_cites[0]}),"
+        return f"{auth_m.group(1)}"
     if bucket == 5 and unique_cites:
-        return f"For {topic} in {unique_cites[0]},"
-
-    if auth_m:
-        return f"{auth_m.group(1)} examined {topic}"
-    if has_lead:
-        return f"{lead_m.group(1)}. Here,"
-    if unique_cites:
-        return f"With {topic} in {unique_cites[0]},"
-    return f"For {topic},"
+        return f"Evidence in {unique_cites[0]}"
+    if bucket == 7:
+        topic = _extract_topic_phrase(stripped)
+        if topic and topic != "this setup":
+            return f"{topic[0].upper() + topic[1:]}"
+    return ""
 
 
 def trim_to_last_sentence(text: str) -> str:
@@ -983,6 +1137,9 @@ def _rewrite_chunk_anti_greedy(
     *,
     ollama_base: str,
     model: str,
+    backend: str,
+    base_gguf: str,
+    n_gpu_layers: int,
     length_ratio: float,
     p_skip_top1: float,
     max_p1_for_skip: float,
@@ -994,13 +1151,24 @@ def _rewrite_chunk_anti_greedy(
     banned_clean: List[str],
     constrain_facts: bool,
     num_ctx: int,
+    surrogate_ollama_model: str,
+    surrogate_probes: int,
+    neural_detector_model: str,
+    neural_detector_device: str,
     on_progress: Optional[Callable[[Dict], None]],
     cancel_event: Optional[threading.Event],
     prefix_so_far: str = "",
 ) -> Dict:
-    demo_ban = _chunk_demo_blacklist(chunk_text)
+    demo_dyn_leaks = human_demos.extract_demo_leak_words([{"notes": demo, "paragraph": ""}], chunk_text)
+    demo_ban = _chunk_demo_blacklist(chunk_text, extra_leak_words=demo_dyn_leaks)
     chunk_banned = banned_clean + demo_ban
     fact_guard = build_fact_guard(chunk_text) if constrain_facts else None
+
+    llama_base_llm = None
+    if backend == "llama_cpp":
+        llama_base_llm = backends.LLAMA_CPP_MANAGER.get_model(
+            base_gguf, n_ctx=num_ctx, n_gpu_layers=n_gpu_layers
+        )
 
     src_words = max(1, len(chunk_text.split()))
     target_words = max(20, int(round(src_words * length_ratio)))
@@ -1024,6 +1192,17 @@ def _rewrite_chunk_anti_greedy(
         "cite_rec": 0.0,
         "halluc_nums": 0,
         "halluc_cites": 0,
+        "human_score": 0.0,
+        "human_score_pct": 0,
+        "burstiness_score": 0.0,
+        "sent_len_cv": 0.0,
+        "sent_ppl_cv": None,
+        "overlap_3gram": 0.0,
+        "gltr_top1": None,
+        "gltr_oob": None,
+        "uncond_ppl": None,
+        "binoculars": None,
+        "neural_ai_prob": None,
         "cancelled": False,
     }
     best_rank = -1.0
@@ -1043,9 +1222,15 @@ def _rewrite_chunk_anti_greedy(
         rng = random.Random(seed_val)
         gen = ""
         nlls: List[float] = []
+        sent_nlls: List[List[float]] = []
+        cur_sent_nlls: List[float] = []
         skipped = 0
         word_starts = 0
         t0 = time.time()
+
+        single_session = None
+        if backend == "llama_cpp" and llama_base_llm is not None:
+            single_session = backends.LlamaCppSingleSession(backends.LLAMA_CPP_MANAGER, llama_base_llm, ctx)
 
         if on_progress:
             live = f"{prefix_so_far} {seed_start}".strip() if prefix_so_far else seed_start
@@ -1064,16 +1249,23 @@ def _rewrite_chunk_anti_greedy(
                 best_result["cancelled"] = True
                 return best_result
 
-            tok0, top = next_token_logprobs(ollama_base, model, ctx + gen, top_k=20, num_ctx=num_ctx)
-            if not top:
-                break
+            if single_session is not None:
+                tok0, raw_top = single_session.next_top_tokens(top_k=32)
+                if not raw_top:
+                    break
+                top_items: List[Tuple[Optional[int], str, float, bool]] = raw_top
+            else:
+                tok0, o_top = next_token_logprobs(ollama_base, model, ctx + gen, top_k=20, num_ctx=num_ctx)
+                if not o_top:
+                    break
+                top_items = [(None, t, lp, t in STOP_TOKENS) for (t, lp) in o_top]
 
             cur_full_pre = re.sub(r"\s+", " ", (seed_start + gen)).strip()
             at_sent_end = _ends_clean_sentence(cur_full_pre)
             reached_len = (cur_words >= soft_stop_words and at_sent_end) or (cur_words >= int(target_words * 1.22))
 
-            def _tok_allowed(t: str) -> bool:
-                if t in STOP_TOKENS:
+            def _tok_allowed(t: str, is_eos: bool) -> bool:
+                if is_eos or t in STOP_TOKENS:
                     return False
                 if not is_clean_ascii(t):
                     return False
@@ -1081,59 +1273,65 @@ def _rewrite_chunk_anti_greedy(
                     return False
                 return True
 
-            if reached_len and tok0 in STOP_TOKENS:
+            if reached_len and (tok0 in STOP_TOKENS or (top_items and top_items[0][3])):
                 break
 
             clean = [
-                (t, lp)
-                for (t, lp) in top
-                if _tok_allowed(t)
-                and not _causes_banned_bpe(seed_start + gen, t, chunk_banned)
-                and not _causes_demo_leak_or_repeat(seed_start + gen, t, demo_ban)
-                and (not fact_guard or not _violates_fact_guard(seed_start + gen, t, fact_guard))
+                item
+                for item in top_items
+                if _tok_allowed(item[1], item[3])
+                and not _causes_banned_bpe(seed_start + gen, item[1], chunk_banned)
+                and not _causes_demo_leak_or_repeat(seed_start + gen, item[1], demo_ban)
+                and (not fact_guard or not _violates_fact_guard(seed_start + gen, item[1], fact_guard))
             ]
             if not clean:
                 clean = [
-                    (t, lp)
-                    for (t, lp) in top
-                    if _tok_allowed(t)
-                    and not _causes_demo_leak_or_repeat(seed_start + gen, t, demo_ban)
-                    and (not fact_guard or not _violates_fact_guard(seed_start + gen, t, fact_guard))
+                    item
+                    for item in top_items
+                    if _tok_allowed(item[1], item[3])
+                    and not _causes_demo_leak_or_repeat(seed_start + gen, item[1], demo_ban)
+                    and (not fact_guard or not _violates_fact_guard(seed_start + gen, item[1], fact_guard))
                 ]
             if not clean:
-                # Non-digit fallback first so we never hallucinate numbers on rare edge cases
-                clean = [(t, lp) for (t, lp) in top if _tok_allowed(t) and not any(ch.isdigit() for ch in t) and "[" not in t]
+                clean = [item for item in top_items if _tok_allowed(item[1], item[3]) and not any(ch.isdigit() for ch in item[1]) and "[" not in item[1]]
             if not clean:
-                clean = [(t, lp) for (t, lp) in top if _tok_allowed(t)]
+                clean = [item for item in top_items if _tok_allowed(item[1], item[3])]
             if not clean:
                 break
 
-            chosen_tok, chosen_lp = clean[0]
+            chosen_tid, chosen_tok, chosen_lp, _ = clean[0]
             p0 = math.exp(chosen_lp)
             in_fact = bool(fact_guard and _is_active_fact_token(seed_start + gen, chosen_tok, fact_guard))
             if WORD_START_RE.match(chosen_tok) and not in_fact:
                 word_starts += 1
                 if p0 <= max_p1_for_skip and rng.random() < p_skip_top1:
-                    # Adaptive plausibility floor prevents jumping to nonsensical 1% tokens when p0 is high
                     alt_floor = max(min_alt_prob, 0.05 * p0)
                     alts = [
-                        (t, lp)
-                        for (t, lp) in clean[1 : max(2, pool_size + 1)]
-                        if WORD_START_RE.match(t) and math.exp(lp) >= alt_floor and "\n" not in t
+                        item
+                        for item in clean[1 : max(2, pool_size + 1)]
+                        if WORD_START_RE.match(item[1]) and math.exp(item[2]) >= alt_floor and "\n" not in item[1]
                     ]
                     if alts:
-                        weights = [math.exp(lp) ** 0.45 for _, lp in alts]
-                        chosen_tok, chosen_lp = rng.choices(alts, weights=weights, k=1)[0]
+                        weights = [math.exp(item[2]) ** 0.45 for item in alts]
+                        chosen_tid, chosen_tok, chosen_lp, _ = rng.choices(alts, weights=weights, k=1)[0]
                         skipped += 1
 
             if reached_len and "\n" in chosen_tok:
                 break
 
+            if single_session is not None and chosen_tid is not None:
+                single_session.accept_token(chosen_tid)
+
             gen += chosen_tok
-            nlls.append(-chosen_lp)
+            nll_val = -chosen_lp
+            nlls.append(nll_val)
+            cur_sent_nlls.append(nll_val)
 
             cur_full = re.sub(r"\s+", " ", (seed_start + gen)).strip()
             cur_words = len(cur_full.split())
+            if _ends_clean_sentence(cur_full) and len(cur_sent_nlls) >= 4:
+                sent_nlls.append(cur_sent_nlls)
+                cur_sent_nlls = []
 
             if on_progress and (step % 4 == 0 or chosen_tok.endswith(".")):
                 running_ppl = math.exp(sum(nlls) / max(len(nlls), 1))
@@ -1151,6 +1349,9 @@ def _rewrite_chunk_anti_greedy(
             if cur_words >= soft_stop_words and _ends_clean_sentence(cur_full):
                 break
 
+        if cur_sent_nlls:
+            sent_nlls.append(cur_sent_nlls)
+
         elapsed = round(time.time() - t0, 2)
         ppl = math.exp(sum(nlls) / max(len(nlls), 1)) if nlls else 0.0
         full = trim_to_last_sentence(seed_start + gen)
@@ -1158,6 +1359,19 @@ def _rewrite_chunk_anti_greedy(
         len_factor = _length_penalty_factor(actual_words, target_words)
         ok_len = actual_words >= int(target_words * 0.85)
         fid = compute_fidelity_metrics(chunk_text, full)
+
+        sur = surrogates.evaluate_candidate_surrogates(
+            full,
+            chunk_text,
+            sent_nlls=sent_nlls,
+            ollama_base=ollama_base,
+            surrogate_ollama_model=surrogate_ollama_model,
+            surrogate_probes=surrogate_probes,
+            num_ctx=num_ctx,
+            neural_detector_model=neural_detector_model,
+            neural_detector_device=neural_detector_device,
+            cancel_event=cancel_event,
+        )
 
         cand = {
             "text": full,
@@ -1169,17 +1383,24 @@ def _rewrite_chunk_anti_greedy(
             "seed": seed_val,
             "elapsed": elapsed,
             **fid,
+            **sur,
             "cancelled": False,
         }
 
         ppl_sat = min(1.0, ppl / max(1.0, min_ppl))
         fluency = 1.0 if ppl <= 10.5 else max(0.35, 10.5 / ppl)
-        rank = (0.55 * fid["fidelity"] + 0.45 * ppl_sat) * fluency * len_factor
+        has_ext_sur = (sur.get("neural_ai_prob") is not None) or (sur.get("gltr_top1") is not None)
+        if has_ext_sur:
+            det_part = 0.55 * sur["human_score"] + 0.45 * ppl_sat
+        else:
+            det_part = 0.25 * sur["burstiness_score"] + 0.75 * ppl_sat
+        rank = (0.50 * fid["fidelity"] + 0.50 * det_part) * fluency * len_factor
         if rank > best_rank and actual_words >= 10:
             best_rank = rank
             best_result = cand
 
-        if ppl >= min_ppl and ok_len and fid["fidelity"] >= 0.80 and fid["halluc_nums"] == 0 and fid["halluc_cites"] == 0:
+        sur_ok = (not has_ext_sur) or bool(sur.get("passes_surrogate"))
+        if ppl >= min_ppl and ok_len and fid["fidelity"] >= 0.80 and fid["halluc_nums"] == 0 and fid["halluc_cites"] == 0 and sur_ok:
             break
 
     return best_result
@@ -1192,6 +1413,9 @@ def rewrite_paragraph(
     *,
     ollama_base: str = DEFAULT_OLLAMA_BASE,
     model: str = DEFAULT_MODEL,
+    backend: str = "ollama",
+    base_gguf: str = "",
+    n_gpu_layers: int = -1,
     length_ratio: float = DEFAULT_LENGTH_RATIO,
     max_tokens: Optional[int] = None,
     p_skip_top1: float = 0.72,
@@ -1204,6 +1428,10 @@ def rewrite_paragraph(
     banned_substrs: Optional[List[str]] = None,
     constrain_facts: bool = True,
     num_ctx: int = DEFAULT_NUM_CTX,
+    surrogate_ollama_model: str = "",
+    surrogate_probes: int = 16,
+    neural_detector_model: str = "",
+    neural_detector_device: str = "cpu",
     on_progress: Optional[Callable[[Dict], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict:
@@ -1222,6 +1450,10 @@ def rewrite_paragraph(
     total_elapsed = 0.0
     weighted_log_ppl = 0.0
     last_attempt = 1
+    sur_human_scores: List[float] = []
+    sur_bursts: List[float] = []
+    sur_neural_probs: List[float] = []
+    sur_gltr_t1: List[float] = []
 
     for c_idx, chunk in enumerate(chunks):
         c_seed_start = seed_start if c_idx == 0 else make_seed_start(chunk, c_idx)
@@ -1234,6 +1466,9 @@ def rewrite_paragraph(
             seed_start=c_seed_start,
             ollama_base=ollama_base,
             model=model,
+            backend=backend,
+            base_gguf=base_gguf,
+            n_gpu_layers=n_gpu_layers,
             length_ratio=length_ratio,
             p_skip_top1=p_skip_top1,
             max_p1_for_skip=max_p1_for_skip,
@@ -1245,6 +1480,10 @@ def rewrite_paragraph(
             banned_clean=banned_clean,
             constrain_facts=constrain_facts,
             num_ctx=num_ctx,
+            surrogate_ollama_model=surrogate_ollama_model,
+            surrogate_probes=surrogate_probes,
+            neural_detector_model=neural_detector_model,
+            neural_detector_device=neural_detector_device,
             on_progress=on_progress,
             cancel_event=cancel_event,
             prefix_so_far=prefix_so_far,
@@ -1252,6 +1491,7 @@ def rewrite_paragraph(
         if res.get("cancelled"):
             return {
                 "mode": "anti_greedy",
+                "backend": backend,
                 "text": " ".join(parts) if parts else source_para.strip(),
                 "ppl": 0.0,
                 "inst_ppl": None,
@@ -1275,6 +1515,14 @@ def rewrite_paragraph(
         total_elapsed += res["elapsed"]
         weighted_log_ppl += math.log(max(1.0, res["ppl"])) * toks
         last_attempt = res["attempt"]
+        if res.get("human_score") is not None:
+            sur_human_scores.append(float(res["human_score"]))
+        if res.get("burstiness_score") is not None:
+            sur_bursts.append(float(res["burstiness_score"]))
+        if res.get("neural_ai_prob") is not None:
+            sur_neural_probs.append(float(res["neural_ai_prob"]))
+        if res.get("gltr_top1") is not None:
+            sur_gltr_t1.append(float(res["gltr_top1"]))
 
     combined_text = re.sub(r"\s+", " ", " ".join(parts)).strip()
     agg_ppl = math.exp(weighted_log_ppl / max(1, total_tokens)) if total_tokens else 0.0
@@ -1282,9 +1530,12 @@ def rewrite_paragraph(
     src_words = max(1, len(source_para.split()))
     out_words = len(combined_text.split())
     fid = compute_fidelity_metrics(source_para, combined_text)
+    full_burst = surrogates.compute_burstiness_and_overlap(combined_text, source_para)
+    avg_hs = round(sum(sur_human_scores) / len(sur_human_scores), 3) if sur_human_scores else full_burst["burstiness_score"]
 
     final = {
         "mode": "anti_greedy",
+        "backend": backend,
         "text": combined_text,
         "ppl": round(agg_ppl, 2),
         "inst_ppl": None,
@@ -1300,6 +1551,14 @@ def rewrite_paragraph(
         "seed": base_seed,
         "elapsed": round(total_elapsed, 2),
         **fid,
+        "human_score": avg_hs,
+        "human_score_pct": int(round(100.0 * avg_hs)),
+        "burstiness_score": round(sum(sur_bursts) / len(sur_bursts), 3) if sur_bursts else full_burst["burstiness_score"],
+        "sent_len_cv": full_burst["sent_len_cv"],
+        "overlap_3gram": full_burst["overlap_3gram"],
+        "gltr_top1": round(sum(sur_gltr_t1) / len(sur_gltr_t1), 3) if sur_gltr_t1 else None,
+        "neural_ai_prob": round(sum(sur_neural_probs) / len(sur_neural_probs), 4) if sur_neural_probs else None,
+        "binoculars": None,
         "judge_score": None,
         "cancelled": False,
     }
@@ -1315,6 +1574,10 @@ def _rewrite_chunk_contrastive(
     ollama_base: str,
     base_model: str,
     instruct_model: str,
+    backend: str,
+    base_gguf: str,
+    instruct_gguf: str,
+    n_gpu_layers: int,
     length_ratio: float,
     alpha: float,
     min_base_prob: float,
@@ -1329,34 +1592,72 @@ def _rewrite_chunk_contrastive(
     constrain_facts: bool,
     use_judge: bool,
     cad_blind: bool,
+    dynamic_alpha: bool,
+    use_human_demos: bool,
+    demo_pool: Sequence[Dict[str, str]],
+    contrastive_banned: List[str],
     num_ctx: int,
+    surrogate_ollama_model: str,
+    surrogate_probes: int,
+    neural_detector_model: str,
+    neural_detector_device: str,
+    binoculars_threshold: float,
     on_progress: Optional[Callable[[Dict], None]],
     cancel_event: Optional[threading.Event],
     prefix_so_far: str = "",
 ) -> Dict:
     fact_guard = build_fact_guard(chunk_text) if constrain_facts else None
 
-    # Stage-0 Telegraphic Note Extraction (breaks ChatGPT 3-sentence skeleton cleanly)
-    notes_text = (
-        extract_telegraphic_notes(
-            chunk_text,
-            ollama_base=ollama_base,
-            instruct_model=instruct_model,
-            num_ctx=num_ctx,
+    llama_base_llm = None
+    llama_inst_llm = None
+    inst_template_name = instruct_model
+    if backend == "llama_cpp":
+        llama_base_llm = backends.LLAMA_CPP_MANAGER.get_model(
+            base_gguf, n_ctx=num_ctx, n_gpu_layers=n_gpu_layers
         )
-        if use_telegraphic
-        else chunk_text.strip()
-    )
+        llama_inst_llm = backends.LLAMA_CPP_MANAGER.get_model(
+            instruct_gguf, n_ctx=num_ctx, n_gpu_layers=n_gpu_layers
+        )
+        backends.LLAMA_CPP_MANAGER.verify_vocab_alignment(llama_base_llm, llama_inst_llm)
+        inst_template_name = instruct_gguf or instruct_model
+
+    # Cache Stage-0 telegraphic decompositions by variant bucket so retries explore
+    # genuinely distinct discourse skeletons without regenerating on every single attempt.
+    notes_cache: Dict[int, str] = {}
+
+    def _get_notes_for_attempt(attempt_num: int, seed_val: int) -> str:
+        if not use_telegraphic:
+            return chunk_text.strip()
+        # Refresh organizational perspective every 2 attempts (1-2 -> v0, 3-4 -> v1, 5-6 -> v2...)
+        v_bucket = (attempt_num - 1) // 2
+        if v_bucket not in notes_cache:
+            schema_idx = (base_seed // 13 + v_bucket) % len(NOTE_EXTRACTION_SCHEMAS)
+            shuffle_s = (seed_val + 97) if v_bucket > 0 else None
+            notes_cache[v_bucket] = extract_telegraphic_notes(
+                chunk_text,
+                ollama_base=ollama_base,
+                instruct_model=inst_template_name,
+                num_ctx=num_ctx,
+                variant_idx=schema_idx,
+                shuffle_seed=shuffle_s,
+                backend=backend,
+                llama_llm=llama_inst_llm,
+            )
+        return notes_cache[v_bucket]
 
     src_words = max(1, len(chunk_text.split()))
     target_words = max(22, int(round(src_words * length_ratio)))
     anchor_words = len(anchor.split())
     gen_target_words = max(18, target_words - anchor_words)
 
-    # Telegraphic notes remove AI padding, so natural complete rewrites can cleanly finish around ~78% of source words
     stop_ratio = 0.78 if use_telegraphic else 0.90
     soft_stop_words = max(24, int(round(target_words * stop_ratio)))
     max_tokens = max(95, int(gen_target_words * 1.50) + 30)
+
+    # Number of human style demos that safely fit inside num_ctx alongside notes + output
+    n_demos = 0
+    if use_human_demos and demo_pool:
+        n_demos = 2 if num_ctx >= 3072 else 1
 
     best_result = {
         "text": chunk_text.strip(),
@@ -1374,6 +1675,18 @@ def _rewrite_chunk_contrastive(
         "halluc_nums": 0,
         "halluc_cites": 0,
         "judge_score": None,
+        "human_score": 0.0,
+        "human_score_pct": 0,
+        "passes_surrogate": False,
+        "burstiness_score": 0.0,
+        "sent_len_cv": 0.0,
+        "sent_ppl_cv": None,
+        "overlap_3gram": 0.0,
+        "gltr_top1": None,
+        "gltr_oob": None,
+        "uncond_ppl": None,
+        "binoculars": None,
+        "neural_ai_prob": None,
         "cancelled": False,
     }
     best_rank = -1.0
@@ -1387,40 +1700,81 @@ def _rewrite_chunk_contrastive(
 
         seed_val = base_seed + (attempt - 1) * 53
         reg_idx = (seed_val // 17 + attempt) % len(CONTRASTIVE_REGISTERS)
-        base_prompt = CONTRASTIVE_REGISTERS[reg_idx].format(
+        notes_text = _get_notes_for_attempt(attempt, seed_val)
+
+        # Retrieve real human few-shot demos for Base ONLY (Instruct sees generic prompt!)
+        active_demos: List[Dict[str, str]] = []
+        demo_ban: List[str] = []
+        if n_demos > 0:
+            active_demos = human_demos.retrieve_human_demos(
+                chunk_text,
+                demo_pool,
+                k=n_demos,
+                attempt=attempt,
+                seed=base_seed,
+            )
+            demo_ban = human_demos.extract_demo_leak_words(active_demos, chunk_text)
+
+        # Allow free start on later retries if anchor was non-empty and not an explicit heading
+        cur_anchor = anchor
+        if attempt >= 3 and anchor and not re.match(r"^(?:[A-Z]{1,4}\d+\.\s+|[A-Z][A-Za-z0-9\-\s]{2,45}\.\s)$", anchor):
+            cur_anchor = "" if (attempt % 2 == 1) else anchor
+
+        base_core = CONTRASTIVE_REGISTERS[reg_idx].format(
             notes=notes_text,
-            anchor=anchor,
+            anchor=cur_anchor,
         )
+        if active_demos:
+            demos_prefix = human_demos.format_human_demos_block(active_demos)
+            base_prompt = f"{demos_prefix}\n\n---\n\n{base_core}"
+        else:
+            base_prompt = base_core
+
         if cad_blind:
             inst_prompt = format_instruct_prompt(
-                instruct_model,
+                inst_template_name,
                 "Write a formal academic paragraph.",
-                assistant_prefix=anchor,
+                assistant_prefix=cur_anchor,
             )
         else:
             inst_prompt = format_instruct_prompt(
-                instruct_model,
+                inst_template_name,
                 f"Write a formal academic paragraph from these notes:\n{notes_text}",
-                assistant_prefix=anchor,
+                assistant_prefix=cur_anchor,
             )
 
-        # Respect user's configured alpha & temp, plus adaptive escalation if prior attempts missed min_inst_ppl
-        alpha_jit = max(0.10, min(1.60, alpha + alpha_boost + [0.0, 0.03, -0.02, 0.04, 0.02, -0.02][reg_idx]))
-        temp_jit = max(0.15, min(1.30, temp + temp_boost + [0.0, 0.03, -0.02, 0.04, 0.02, -0.02][reg_idx]))
+        alpha_jit = max(0.12, min(1.60, alpha + alpha_boost + [0.0, 0.03, -0.02, 0.04, 0.02, -0.02][reg_idx]))
+        temp_jit = max(0.18, min(1.30, temp + temp_boost + [0.0, 0.03, -0.02, 0.04, 0.02, -0.02][reg_idx]))
 
+        scheduler = BurstinessScheduler(seed=seed_val + attempt * 7, enabled=dynamic_alpha)
         rng = random.Random(seed_val)
         gen = ""
         base_nlls: List[float] = []
         inst_nlls: List[float] = []
+        sent_inst_nlls: List[List[float]] = []
+        cur_sent_inst_nlls: List[float] = []
+        sent_idx = 0
+        words_in_sent = len(cur_anchor.split())
         tokens_since_bracket = 20
-        cur_words = anchor_words
+        cur_words = len(cur_anchor.split())
         t0 = time.time()
 
+        exact_session = None
+        if backend == "llama_cpp" and llama_base_llm is not None and llama_inst_llm is not None:
+            exact_session = backends.LlamaCppContrastiveSession(
+                backends.LLAMA_CPP_MANAGER,
+                llama_base_llm,
+                llama_inst_llm,
+                base_prompt,
+                inst_prompt,
+            )
+
         if on_progress:
-            live = f"{prefix_so_far} {anchor}".strip() if prefix_so_far else anchor
+            live = f"{prefix_so_far} {cur_anchor}".strip() if prefix_so_far else cur_anchor
             on_progress({
                 "event": "attempt_start",
                 "mode": "contrastive",
+                "backend": backend,
                 "attempt": attempt,
                 "attempts": attempts,
                 "seed": seed_val,
@@ -1432,24 +1786,36 @@ def _rewrite_chunk_contrastive(
                 best_result["cancelled"] = True
                 return best_result
 
-            _, b_top = next_token_logprobs(ollama_base, base_model, base_prompt + gen, top_k=20, num_ctx=num_ctx)
-            if not b_top:
-                break
-            _, i_top = next_token_logprobs(ollama_base, instruct_model, inst_prompt + gen, top_k=20, num_ctx=num_ctx)
-            i_map = {t: lp for t, lp in i_top}
-            raw_min_i = (min(i_map.values()) - 1.5) if i_map else -10.0
+            # Fetch next-token candidates from either Exact Full-Vocab llama.cpp or Ollama
+            if exact_session is not None:
+                raw_cands = exact_session.next_exact_candidates(top_base_k=48)
+                if not raw_cands:
+                    break
+                # (tid, tok, b_lp, raw_i_lp, is_eos)
+                step_cands = raw_cands
+            else:
+                _, b_top = next_token_logprobs(ollama_base, base_model, base_prompt + gen, top_k=20, num_ctx=num_ctx)
+                if not b_top:
+                    break
+                _, i_top = next_token_logprobs(ollama_base, instruct_model, inst_prompt + gen, top_k=20, num_ctx=num_ctx)
+                i_map = {t: lp for t, lp in i_top}
+                raw_min_i = (min(i_map.values()) - 1.5) if i_map else -10.0
+                step_cands = [
+                    (None, tok, b_lp, i_map.get(tok, raw_min_i), tok in STOP_TOKENS)
+                    for tok, b_lp in b_top
+                ]
 
-            cur_full_pre = re.sub(r"\s+", " ", (anchor + gen)).strip()
+            cur_full_pre = re.sub(r"\s+", " ", (cur_anchor + gen)).strip()
             at_sent_end = _ends_clean_sentence(cur_full_pre)
             reached_len = (cur_words >= soft_stop_words and at_sent_end) or (cur_words >= int(target_words * 1.20))
 
-            top_b_lp = max(lp for _, lp in b_top)
+            top_b_lp = max(c[2] for c in step_cands)
             top_b_prob = math.exp(top_b_lp)
             plaus_thresh = max(min_base_prob, beta * top_b_prob)
 
             scored = []
-            for tok, b_lp in b_top:
-                if tok in STOP_TOKENS:
+            for tid, tok, b_lp, raw_i_lp, is_eos in step_cands:
+                if is_eos or tok in STOP_TOKENS:
                     continue
                 if not is_clean_ascii(tok) or "—" in tok or "–" in tok:
                     continue
@@ -1457,76 +1823,100 @@ def _rewrite_chunk_contrastive(
                     continue
                 if "[" in tok and tokens_since_bracket < 12:
                     continue
-                if re.search(r"\b(?:Notes|Source|Paragraph|Study|Method|Result|Detail|Context)\s*:", (anchor + gen)[-15:] + tok):
+                if re.search(r"\b(?:Notes|Source|Paragraph|Study|Method|Result|Detail|Context)\s*:", (cur_anchor + gen)[-15:] + tok):
                     continue
-                # Block immediate repeated 2-word phrase loops or same >=5-char word repeated within 3 words
-                cand_ws = re.sub(r"[^a-z0-9\s\-]", " ", (anchor + gen + tok).lower()).split()
+                # Enforce Contrastive BPE blacklist (AI clichés + archaic drift like whilst/thereof/herein)
+                if contrastive_banned and _causes_banned_bpe(cur_anchor + gen, tok, contrastive_banned):
+                    continue
+                # Block AI cliché openings when starting freely
+                if not cur_anchor and step < 6 and _causes_opening_cliche(gen, tok):
+                    continue
+                cand_ws = re.sub(r"[^a-z0-9\s\-]", " ", (cur_anchor + gen + tok).lower()).split()
                 if len(cand_ws) >= 4 and cand_ws[-2:] == cand_ws[-4:-2]:
                     continue
                 if WORD_START_RE.match(tok):
                     tw = tok.strip().lower()
                     if len(tw) >= 5 and len(cand_ws) >= 2 and tw in cand_ws[-4:-1]:
                         continue
-                if _causes_demo_leak_or_repeat(anchor + gen, tok, []):
+                if _causes_demo_leak_or_repeat(cur_anchor + gen, tok, demo_ban):
                     continue
-                if fact_guard and _violates_fact_guard(anchor + gen, tok, fact_guard):
+                if fact_guard and _violates_fact_guard(cur_anchor + gen, tok, fact_guard):
                     continue
-                # Adaptive Plausibility Gate (Li et al. 2023): keep plausible base continuations
+                # Adaptive Plausibility Gate (Li et al. 2023)
                 if math.exp(b_lp) < plaus_thresh and len(scored) >= 1:
                     continue
 
-                raw_i_lp = i_map.get(tok, raw_min_i)
                 eff_i_lp = max(raw_i_lp, i_floor)
-                in_fact = bool(fact_guard and _is_active_fact_token(anchor + gen, tok, fact_guard))
-                eff_alpha = (alpha_jit * 0.25) if in_fact else alpha_jit
-                c_score = b_lp - eff_alpha * eff_i_lp
-                scored.append((tok, c_score, b_lp, raw_i_lp))
+                in_fact = bool(fact_guard and _is_active_fact_token(cur_anchor + gen, tok, fact_guard))
+                eff_alpha, cadence_nudge = scheduler.modulate(
+                    alpha_jit,
+                    tok,
+                    sent_idx=sent_idx,
+                    words_in_sent=words_in_sent,
+                    in_fact=in_fact,
+                )
+                c_score = b_lp - eff_alpha * eff_i_lp + cadence_nudge
+                scored.append((tid, tok, c_score, b_lp, raw_i_lp))
 
             if not scored:
                 fallback = [
-                    (t, b_lp)
-                    for (t, b_lp) in b_top
-                    if t not in STOP_TOKENS
-                    and is_clean_ascii(t)
-                    and ("\n" not in t or reached_len)
-                    and (not fact_guard or not _violates_fact_guard(anchor + gen, t, fact_guard))
+                    c for c in step_cands
+                    if not c[4]
+                    and c[1] not in STOP_TOKENS
+                    and is_clean_ascii(c[1])
+                    and ("\n" not in c[1] or reached_len)
+                    and not _causes_demo_leak_or_repeat(cur_anchor + gen, c[1], demo_ban)
+                    and (not fact_guard or not _violates_fact_guard(cur_anchor + gen, c[1], fact_guard))
                 ]
                 if not fallback:
                     fallback = [
-                        (t, b_lp)
-                        for (t, b_lp) in b_top
-                        if t not in STOP_TOKENS
-                        and is_clean_ascii(t)
-                        and ("\n" not in t or reached_len)
-                        and not any(ch.isdigit() for ch in t)
-                        and "[" not in t
+                        c for c in step_cands
+                        if not c[4]
+                        and c[1] not in STOP_TOKENS
+                        and is_clean_ascii(c[1])
+                        and ("\n" not in c[1] or reached_len)
+                        and not any(ch.isdigit() for ch in c[1])
+                        and "[" not in c[1]
                     ]
                 if not fallback:
-                    fallback = [(t, b_lp) for (t, b_lp) in b_top if t not in STOP_TOKENS and is_clean_ascii(t)]
+                    fallback = [c for c in step_cands if not c[4] and c[1] not in STOP_TOKENS and is_clean_ascii(c[1])]
                 if not fallback:
                     break
-                tok, b_lp = fallback[0]
-                raw_i_lp = i_map.get(tok, raw_min_i)
-                scored = [(tok, b_lp - alpha_jit * max(raw_i_lp, i_floor), b_lp, raw_i_lp)]
+                tid, tok, b_lp, raw_i_lp, _ = fallback[0]
+                scored = [(tid, tok, b_lp - alpha_jit * max(raw_i_lp, i_floor), b_lp, raw_i_lp)]
 
-            scored.sort(key=lambda x: x[1], reverse=True)
+            scored.sort(key=lambda x: x[2], reverse=True)
             pool = scored[: max(2, pool_size)]
-            mx = pool[0][1]
+            mx = pool[0][2]
             eff_temp = max(0.05, temp_jit)
-            weights = [math.exp((x[1] - mx) / eff_temp) for x in pool]
-            chosen_tok, _, b_lp, raw_i_lp = rng.choices(pool, weights=weights, k=1)[0]
+            weights = [math.exp((x[2] - mx) / eff_temp) for x in pool]
+            chosen_tid, chosen_tok, _, b_lp, raw_i_lp = rng.choices(pool, weights=weights, k=1)[0]
 
             if "\n" in chosen_tok and reached_len:
                 break
+
+            if exact_session is not None and chosen_tid is not None:
+                exact_session.accept_token(chosen_tid)
+
             gen += chosen_tok
             tokens_since_bracket = 0 if "[" in chosen_tok else (tokens_since_bracket + 1)
             base_nlls.append(-b_lp)
             inst_nlls.append(-raw_i_lp)
+            cur_sent_inst_nlls.append(-raw_i_lp)
 
-            cur_full = re.sub(r"\s+", " ", (anchor + gen)).strip()
+            cur_full = re.sub(r"\s+", " ", (cur_anchor + gen)).strip()
             if cur_words >= int(target_words * 0.70) and re.search(r"\b(?:Source|Rewrite|Notes|Paragraph)\s*:", gen):
                 break
-            cur_words = len(cur_full.split())
+            new_words = len(cur_full.split())
+            if new_words > cur_words:
+                words_in_sent += (new_words - cur_words)
+            cur_words = new_words
+
+            if _ends_clean_sentence(cur_full) and len(cur_sent_inst_nlls) >= 4:
+                sent_inst_nlls.append(cur_sent_inst_nlls)
+                cur_sent_inst_nlls = []
+                sent_idx += 1
+                words_in_sent = 0
 
             if on_progress and (step % 4 == 0 or chosen_tok.endswith(".")):
                 r_bppl = math.exp(sum(base_nlls) / max(len(base_nlls), 1))
@@ -1535,6 +1925,7 @@ def _rewrite_chunk_contrastive(
                 on_progress({
                     "event": "token",
                     "mode": "contrastive",
+                    "backend": backend,
                     "attempt": attempt,
                     "attempts": attempts,
                     "text": live,
@@ -1546,10 +1937,13 @@ def _rewrite_chunk_contrastive(
             if cur_words >= soft_stop_words and _ends_clean_sentence(cur_full):
                 break
 
+        if cur_sent_inst_nlls:
+            sent_inst_nlls.append(cur_sent_inst_nlls)
+
         elapsed = round(time.time() - t0, 2)
         base_ppl = math.exp(sum(base_nlls) / max(len(base_nlls), 1)) if base_nlls else 0.0
         inst_ppl = math.exp(sum(inst_nlls) / max(len(inst_nlls), 1)) if inst_nlls else 0.0
-        full = trim_to_last_sentence(anchor + gen)
+        full = trim_to_last_sentence(cur_anchor + gen)
         actual_words = len(full.split())
         min_len_ratio = 0.70 if use_telegraphic else 0.85
         ok_complete = (
@@ -1567,14 +1961,33 @@ def _rewrite_chunk_contrastive(
 
         fid = compute_fidelity_metrics(chunk_text, full)
 
+        # Multi-signal independent surrogate evaluation (Step 2)
+        sur = surrogates.evaluate_candidate_surrogates(
+            full,
+            chunk_text,
+            sent_nlls=sent_inst_nlls,
+            ollama_base=ollama_base,
+            surrogate_ollama_model=surrogate_ollama_model,
+            surrogate_probes=surrogate_probes,
+            num_ctx=num_ctx,
+            llama_base_llm=llama_base_llm if backend == "llama_cpp" else None,
+            llama_inst_llm=llama_inst_llm if backend == "llama_cpp" else None,
+            binoculars_threshold=binoculars_threshold,
+            neural_detector_model=neural_detector_model,
+            neural_detector_device=neural_detector_device,
+            cancel_event=cancel_event,
+        )
+
         j_score: Optional[float] = None
         if use_judge and actual_words >= 15 and not (cancel_event and cancel_event.is_set()):
             j_score = judge_faithfulness(
                 chunk_text,
                 full,
                 ollama_base=ollama_base,
-                instruct_model=instruct_model,
+                instruct_model=inst_template_name,
                 num_ctx=num_ctx,
+                backend=backend,
+                llama_llm=llama_inst_llm,
             )
 
         cand = {
@@ -1587,19 +2000,36 @@ def _rewrite_chunk_contrastive(
             "elapsed": elapsed,
             "ok_complete": ok_complete,
             **fid,
+            **sur,
             "judge_score": j_score,
             "cancelled": False,
         }
 
-        # Pass-tier ranking: drafts clearing BOTH min_inst_ppl AND BasePPL >= 6.5 are promoted into Tier 1,
-        # and within Tier 1 we select the HIGHEST factual fidelity + faithfulness judge score!
-        clears_detector = (inst_ppl >= min_inst_ppl) and (base_ppl >= 6.5)
-        if clears_detector:
-            detector_mult = 2.0
+        # Multi-signal pass-tier ranking:
+        # When independent external surrogates (Neural Detector / Exact Binoculars / Unconditional GLTR)
+        # are active, they govern detector clearance instead of letting conditional InstPPL create false greens!
+        has_strong_surrogate = (
+            (sur.get("neural_ai_prob") is not None)
+            or (sur.get("binoculars") is not None)
+            or (sur.get("gltr_top1") is not None)
+        )
+        clears_internal = (inst_ppl >= min_inst_ppl) and (base_ppl >= 5.5 if backend == "llama_cpp" else base_ppl >= 6.5)
+
+        if has_strong_surrogate:
+            clears_detector = bool(sur.get("passes_surrogate")) and (sur["human_score"] >= 0.62)
+            if clears_detector:
+                detector_mult = 1.65 + 0.55 * sur["human_score"]
+            else:
+                detector_mult = 0.20 + 0.90 * sur["human_score"]
         else:
-            ip_frac = min(1.0, inst_ppl / max(1.0, min_inst_ppl))
-            bp_frac = min(1.0, base_ppl / 6.5)
-            detector_mult = 0.25 + 0.75 * (0.65 * ip_frac + 0.35 * bp_frac)
+            # Pure Ollama base+instruct mode: combine internal PPL with structural burstiness & anti-paraphrase distance
+            clears_detector = clears_internal and (sur["overlap_3gram"] <= 0.24) and (sur["burstiness_score"] >= 0.48)
+            if clears_detector:
+                detector_mult = 1.75 + 0.35 * sur["burstiness_score"]
+            else:
+                ip_frac = min(1.0, inst_ppl / max(1.0, min_inst_ppl))
+                bp_frac = min(1.0, base_ppl / 6.5)
+                detector_mult = 0.25 + 0.75 * (0.50 * ip_frac + 0.25 * bp_frac + 0.25 * sur["human_score"])
 
         fluency_cap = 1.0 if base_ppl <= 13.0 else max(0.40, 13.0 / base_ppl)
         punct_mult = 1.0 if (full.endswith(".") and full.count("(") == full.count(")")) else 0.45
@@ -1626,10 +2056,15 @@ def _rewrite_chunk_contrastive(
         ):
             break
 
-        # Adaptive alpha escalation: if this attempt fell short of min_inst_ppl, step up alpha & temp on next retry!
-        if inst_ppl < min_inst_ppl or base_ppl < 6.5:
-            alpha_boost = min(0.32, alpha_boost + 0.08)
+        # Bidirectional adaptive schedule:
+        #   - If too AI-like (failed detector gate), step alpha & temp UP.
+        #   - If detector cleared (or BasePPL too high) but Judge/Fidelity failed, step alpha DOWN!
+        if not clears_detector:
+            alpha_boost = min(0.32, alpha_boost + 0.07)
             temp_boost = min(0.18, temp_boost + 0.04)
+        elif (not judge_ok) or (fid["fidelity"] < 0.78) or (base_ppl > 13.5):
+            alpha_boost = max(-0.18, alpha_boost - 0.06)
+            temp_boost = max(-0.12, temp_boost - 0.03)
 
     return best_result
 
@@ -1641,11 +2076,15 @@ def rewrite_paragraph_contrastive(
     ollama_base: str = DEFAULT_OLLAMA_BASE,
     base_model: str = DEFAULT_MODEL,
     instruct_model: str = DEFAULT_INSTRUCT_MODEL,
+    backend: str = "ollama",
+    base_gguf: str = "",
+    instruct_gguf: str = "",
+    n_gpu_layers: int = -1,
     length_ratio: float = DEFAULT_LENGTH_RATIO,
     alpha: float = 0.56,
     min_base_prob: float = 0.020,
-    beta: float = 0.020,
-    i_floor: float = -11.5,
+    beta: float = DEFAULT_BETA,
+    i_floor: float = DEFAULT_I_FLOOR,
     temp: float = 0.62,
     pool_size: int = 6,
     min_inst_ppl: float = 350.0,
@@ -1657,15 +2096,32 @@ def rewrite_paragraph_contrastive(
     constrain_facts: bool = True,
     use_judge: bool = True,
     cad_blind: bool = False,
+    dynamic_alpha: bool = True,
+    use_human_demos: bool = True,
+    custom_human_demos: Optional[Sequence[Dict[str, str]]] = None,
+    custom_human_demos_text: str = "",
+    banned_substrs: Optional[List[str]] = None,
     num_ctx: int = DEFAULT_NUM_CTX,
+    surrogate_ollama_model: str = "",
+    surrogate_probes: int = 16,
+    neural_detector_model: str = "",
+    neural_detector_device: str = "cpu",
+    binoculars_threshold: float = 0.90,
     on_progress: Optional[Callable[[Dict], None]] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict:
     """
-    GPTZero Mode: Fact-guarded, length-preserving Contrastive Anti-RLHF Decoding
-    with Stage-0 telegraphic skeleton breaking, Blind-Instruct CAD, and Best-of-N fidelity reranking.
+    GPTZero Mode: Fact-guarded, length-preserving Contrastive Anti-RLHF + Human-Style
+    Decoding with multi-perspective Stage-0, Dynamic Burstiness alpha(t), optional
+    exact full-vocab llama.cpp backend, and multi-signal local surrogate reranking.
     """
     chunks = chunk_paragraph(source_para, max_chunk_words=160)
+    demo_pool = human_demos.get_demo_pool(custom_human_demos, custom_human_demos_text) if use_human_demos else []
+    c_banned = [
+        b.lower().strip()
+        for b in (banned_substrs if banned_substrs is not None else CONTRASTIVE_BANNED_SUBSTRS)
+        if b and b.strip()
+    ]
 
     parts: List[str] = []
     total_tokens = 0
@@ -1673,10 +2129,17 @@ def rewrite_paragraph_contrastive(
     weighted_log_bppl = 0.0
     weighted_log_ippl = 0.0
     judge_scores: List[float] = []
+    human_scores: List[float] = []
+    burst_scores: List[float] = []
+    bino_vals: List[float] = []
+    neural_vals: List[float] = []
+    gltr_t1_vals: List[float] = []
+    gltr_oob_vals: List[float] = []
+    uncond_ppls: List[float] = []
     last_attempt = 1
 
     for c_idx, chunk in enumerate(chunks):
-        c_anchor = anchor if c_idx == 0 else make_contrastive_anchor(chunk, c_idx)
+        c_anchor = anchor if c_idx == 0 else make_contrastive_anchor(chunk, c_idx + base_seed)
         prefix_so_far = " ".join(parts)
 
         res = _rewrite_chunk_contrastive(
@@ -1685,6 +2148,10 @@ def rewrite_paragraph_contrastive(
             ollama_base=ollama_base,
             base_model=base_model,
             instruct_model=instruct_model,
+            backend=backend,
+            base_gguf=base_gguf,
+            instruct_gguf=instruct_gguf,
+            n_gpu_layers=n_gpu_layers,
             length_ratio=length_ratio,
             alpha=alpha,
             min_base_prob=min_base_prob,
@@ -1699,7 +2166,16 @@ def rewrite_paragraph_contrastive(
             constrain_facts=constrain_facts,
             use_judge=use_judge,
             cad_blind=cad_blind,
+            dynamic_alpha=dynamic_alpha,
+            use_human_demos=use_human_demos,
+            demo_pool=demo_pool,
+            contrastive_banned=c_banned,
             num_ctx=num_ctx,
+            surrogate_ollama_model=surrogate_ollama_model,
+            surrogate_probes=surrogate_probes,
+            neural_detector_model=neural_detector_model,
+            neural_detector_device=neural_detector_device,
+            binoculars_threshold=binoculars_threshold,
             on_progress=on_progress,
             cancel_event=cancel_event,
             prefix_so_far=prefix_so_far,
@@ -1707,6 +2183,7 @@ def rewrite_paragraph_contrastive(
         if res.get("cancelled"):
             return {
                 "mode": "contrastive",
+                "backend": backend,
                 "text": " ".join(parts) if parts else source_para.strip(),
                 "ppl": 0.0,
                 "inst_ppl": 0.0,
@@ -1732,6 +2209,20 @@ def rewrite_paragraph_contrastive(
         weighted_log_ippl += math.log(max(1.0, res["inst_ppl"])) * toks
         if res.get("judge_score") is not None:
             judge_scores.append(float(res["judge_score"]))
+        if res.get("human_score") is not None:
+            human_scores.append(float(res["human_score"]))
+        if res.get("burstiness_score") is not None:
+            burst_scores.append(float(res["burstiness_score"]))
+        if res.get("binoculars") is not None:
+            bino_vals.append(float(res["binoculars"]))
+        if res.get("neural_ai_prob") is not None:
+            neural_vals.append(float(res["neural_ai_prob"]))
+        if res.get("gltr_top1") is not None:
+            gltr_t1_vals.append(float(res["gltr_top1"]))
+        if res.get("gltr_oob") is not None:
+            gltr_oob_vals.append(float(res["gltr_oob"]))
+        if res.get("uncond_ppl") is not None:
+            uncond_ppls.append(float(res["uncond_ppl"]))
         last_attempt = res["attempt"]
 
     combined_text = re.sub(r"\s+", " ", " ".join(parts)).strip()
@@ -1740,10 +2231,15 @@ def rewrite_paragraph_contrastive(
     src_words = max(1, len(source_para.split()))
     out_words = len(combined_text.split())
     fid = compute_fidelity_metrics(source_para, combined_text)
+    full_burst = surrogates.compute_burstiness_and_overlap(combined_text, source_para)
+
     avg_judge = round(sum(judge_scores) / len(judge_scores), 1) if judge_scores else None
+    avg_human = round(sum(human_scores) / len(human_scores), 3) if human_scores else full_burst["burstiness_score"]
+    avg_burst = round(sum(burst_scores) / len(burst_scores), 3) if burst_scores else full_burst["burstiness_score"]
 
     final = {
         "mode": "contrastive",
+        "backend": backend,
         "text": combined_text,
         "ppl": round(agg_bppl, 2),
         "inst_ppl": round(agg_ippl, 1),
@@ -1760,6 +2256,16 @@ def rewrite_paragraph_contrastive(
         "seed": base_seed,
         "elapsed": round(total_elapsed, 2),
         **fid,
+        "human_score": avg_human,
+        "human_score_pct": int(round(100.0 * avg_human)),
+        "burstiness_score": avg_burst,
+        "sent_len_cv": full_burst["sent_len_cv"],
+        "overlap_3gram": full_burst["overlap_3gram"],
+        "binoculars": round(sum(bino_vals) / len(bino_vals), 4) if bino_vals else None,
+        "neural_ai_prob": round(sum(neural_vals) / len(neural_vals), 4) if neural_vals else None,
+        "gltr_top1": round(sum(gltr_t1_vals) / len(gltr_t1_vals), 3) if gltr_t1_vals else None,
+        "gltr_oob": round(sum(gltr_oob_vals) / len(gltr_oob_vals), 3) if gltr_oob_vals else None,
+        "uncond_ppl": round(sum(uncond_ppls) / len(uncond_ppls), 2) if uncond_ppls else None,
         "judge_score": avg_judge,
         "cancelled": False,
     }
@@ -1774,14 +2280,20 @@ def build_bootstrap_demo(source_para: str, rewritten_para: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local Base-Model Humanizer CLI (ZeroGPT & GPTZero Modes)")
+    parser = argparse.ArgumentParser(description="Local Base-Model Humanizer CLI (Ollama & llama.cpp)")
     parser.add_argument("--input", "-i", help="Input text file (reads stdin if omitted)")
     parser.add_argument("--output", "-o", help="Output text file (prints stdout if omitted)")
     parser.add_argument(
         "--mode",
         choices=["anti_greedy", "contrastive"],
-        default="anti_greedy",
-        help="Decoding mode: anti_greedy (ZeroGPT) or contrastive (GPTZero Anti-RLHF)",
+        default="contrastive",
+        help="Decoding mode: anti_greedy (ZeroGPT) or contrastive (GPTZero Anti-RLHF + Human Demos)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["ollama", "llama_cpp"],
+        default="ollama",
+        help="Inference backend: ollama (default zero-dep HTTP) or llama_cpp (exact full-vocab GGUF)",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama base model (default: {DEFAULT_MODEL})")
     parser.add_argument(
@@ -1789,24 +2301,36 @@ def main():
         default=DEFAULT_INSTRUCT_MODEL,
         help=f"Same-vocab Ollama instruct model for contrastive mode (default: {DEFAULT_INSTRUCT_MODEL})",
     )
+    parser.add_argument("--base-gguf", default="", help="Local Base GGUF path (for --backend llama_cpp)")
+    parser.add_argument("--instruct-gguf", default="", help="Local Instruct GGUF path (for --backend llama_cpp)")
+    parser.add_argument("--gpu-layers", type=int, default=-1, help="GPU layers to offload in llama_cpp (-1 = all)")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_BASE, help="Ollama base URL")
     parser.add_argument("--length-ratio", type=float, default=DEFAULT_LENGTH_RATIO, help="Target output/input word ratio (default: 1.0)")
     parser.add_argument("--p-skip", type=float, default=0.72, help="Anti-greedy Rank-1 skip prob (default: 0.72)")
     parser.add_argument("--min-ppl", type=float, default=3.8, help="Anti-greedy min target PPL (default: 3.8)")
-    parser.add_argument("--alpha", type=float, default=0.56, help="Contrastive anti-RLHF weight alpha (default: 0.56; use ~1.12 with --blind-cad)")
+    parser.add_argument("--alpha", type=float, default=0.56, help="Contrastive anti-RLHF weight alpha (default: 0.56)")
     parser.add_argument("--min-inst-ppl", type=float, default=350.0, help="Contrastive min target InstPPL (default: 350)")
     parser.add_argument("--temp", type=float, default=0.62, help="Contrastive sampling temperature (default: 0.62)")
-    parser.add_argument("--i-floor", type=float, default=-11.5, help="Contrastive instruct logprob clamp floor (default: -11.5)")
-    parser.add_argument("--beta", type=float, default=0.020, help="Adaptive plausibility ratio beta (default: 0.020)")
-    parser.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX, help=f"Ollama KV cache context window (default: {DEFAULT_NUM_CTX})")
+    parser.add_argument("--i-floor", type=float, default=DEFAULT_I_FLOOR, help=f"Contrastive instruct logprob clamp floor (default: {DEFAULT_I_FLOOR})")
+    parser.add_argument("--beta", type=float, default=DEFAULT_BETA, help=f"Adaptive plausibility ratio beta (default: {DEFAULT_BETA})")
+    parser.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX, help=f"KV cache context window (default: {DEFAULT_NUM_CTX})")
     parser.add_argument("--blind-cad", action="store_true", help="Use Blind-Instruct CAD (higher fidelity, softer anti-paraphrase)")
-    parser.add_argument("--no-telegraphic", action="store_true", help="Disable Stage-0 telegraphic fact decomposition in contrastive mode")
-    parser.add_argument("--no-fact-guard", action="store_true", help="Disable strict numeric & citation prefix whitelist")
+    parser.add_argument("--no-telegraphic", action="store_true", help="Disable Stage-0 telegraphic fact decomposition")
+    parser.add_argument("--no-fact-guard", action="store_true", help="Disable strict numeric/citation/entity fact guard")
     parser.add_argument("--no-judge", action="store_true", help="Disable read-only local Instruct faithfulness judge")
-    parser.add_argument("--attempts", type=int, default=4, help="Max resampling attempts per chunk (default: 4)")
+    parser.add_argument("--no-dynamic-alpha", action="store_true", help="Disable dynamic sentence-aware Burstiness alpha(t) modulation")
+    parser.add_argument("--no-human-demos", action="store_true", help="Disable real human-style few-shot contrastive conditioning")
+    parser.add_argument("--human-demos", default="", help="Path to custom human corpus (.jsonl or .txt) for few-shot contrastive demos")
+    parser.add_argument("--surrogate-model", default="", help="Optional cross-family Ollama model for unconditional GLTR reranking")
+    parser.add_argument("--surrogate-probes", type=int, default=16, help="Number of strided unconditional GLTR probes per candidate (default: 16)")
+    parser.add_argument("--neural-detector", default="", help="Optional local HF neural AI detector (e.g. desklib/ai-text-detector-academic-v1.01)")
+    parser.add_argument("--neural-device", default="cpu", choices=["cpu", "cuda", "auto"], help="Device for local neural detector (default: cpu)")
+    parser.add_argument("--binoculars-threshold", type=float, default=0.90, help="Min exact Binoculars human threshold in llama_cpp mode (default: 0.90)")
+    parser.add_argument("--attempts", type=int, default=4, help="Max resampling attempts per chunk (default: 4; try 12-16 with llama_cpp)")
     parser.add_argument("--seed", type=int, default=401, help="Base random seed (default: 401)")
     args = parser.parse_args()
 
+    custom_demos = human_demos.load_human_demos_file(args.human_demos) if args.human_demos else []
     raw_text = open(args.input, "r", encoding="utf-8").read() if args.input else sys.stdin.read()
     blocks = parse_blocks(raw_text)
     demos = [DEMO_A, DEMO_B]
@@ -1820,7 +2344,7 @@ def main():
             out_lines.append(blk["text"])
             continue
 
-        sys.stderr.write(f"\n=== Paragraph {para_idx + 1} ({args.mode}, {len(blk['text'].split())} words) ===\n")
+        sys.stderr.write(f"\n=== Paragraph {para_idx + 1} ({args.mode}/{args.backend}, {len(blk['text'].split())} words) ===\n")
         if args.mode == "contrastive":
             res = rewrite_paragraph_contrastive(
                 blk["text"],
@@ -1828,6 +2352,10 @@ def main():
                 ollama_base=args.ollama_url,
                 base_model=args.model,
                 instruct_model=args.instruct_model,
+                backend=args.backend,
+                base_gguf=args.base_gguf,
+                instruct_gguf=args.instruct_gguf,
+                n_gpu_layers=args.gpu_layers,
                 length_ratio=args.length_ratio,
                 alpha=args.alpha,
                 beta=args.beta,
@@ -1840,12 +2368,29 @@ def main():
                 constrain_facts=not args.no_fact_guard,
                 use_judge=not args.no_judge,
                 cad_blind=args.blind_cad,
+                dynamic_alpha=not args.no_dynamic_alpha,
+                use_human_demos=not args.no_human_demos,
+                custom_human_demos=custom_demos,
                 num_ctx=args.num_ctx,
+                surrogate_ollama_model=args.surrogate_model,
+                surrogate_probes=args.surrogate_probes,
+                neural_detector_model=args.neural_detector,
+                neural_detector_device=args.neural_device,
+                binoculars_threshold=args.binoculars_threshold,
             )
-            j_str = f" | Judge={res['judge_score']}/10" if res.get("judge_score") is not None else ""
+            extras = [f"Human={res['human_score_pct']}%", f"Burst={res['burstiness_score']}"]
+            if res.get("binoculars") is not None:
+                extras.append(f"Binoc={res['binoculars']}")
+            if res.get("gltr_top1") is not None:
+                extras.append(f"GLTR_T1={int(round(res['gltr_top1'] * 100))}%")
+            if res.get("neural_ai_prob") is not None:
+                extras.append(f"NeuralAI={int(round(res['neural_ai_prob'] * 100))}%")
+            if res.get("judge_score") is not None:
+                extras.append(f"Judge={res['judge_score']}/10")
             sys.stderr.write(
                 f"  -> {res['source_words']} -> {res['output_words']} words ({res['length_pct']}%) | chunks={res['chunks']} "
-                f"| BasePPL={res['ppl']} | InstPPL={res['inst_ppl']} | Fid={res['fidelity_pct']}% (hN={res['halluc_nums']}, hC={res['halluc_cites']}){j_str} | {res['elapsed']}s\n"
+                f"| BasePPL={res['ppl']} | InstPPL={res['inst_ppl']} | Fid={res['fidelity_pct']}% (hN={res['halluc_nums']}, hC={res['halluc_cites']}) "
+                f"| {' | '.join(extras)} | {res['elapsed']}s\n"
             )
         else:
             res = rewrite_paragraph(
@@ -1854,6 +2399,9 @@ def main():
                 seed_start=make_seed_start(blk["text"], para_idx),
                 ollama_base=args.ollama_url,
                 model=args.model,
+                backend=args.backend,
+                base_gguf=args.base_gguf,
+                n_gpu_layers=args.gpu_layers,
                 length_ratio=args.length_ratio,
                 p_skip_top1=args.p_skip,
                 min_ppl=args.min_ppl,
@@ -1861,10 +2409,15 @@ def main():
                 base_seed=args.seed + para_idx * 101,
                 constrain_facts=not args.no_fact_guard,
                 num_ctx=args.num_ctx,
+                surrogate_ollama_model=args.surrogate_model,
+                surrogate_probes=args.surrogate_probes,
+                neural_detector_model=args.neural_detector,
+                neural_detector_device=args.neural_device,
             )
             sys.stderr.write(
                 f"  -> {res['source_words']} -> {res['output_words']} words ({res['length_pct']}%) | chunks={res['chunks']} "
-                f"| PPL={res['ppl']} | Fid={res['fidelity_pct']}% (hN={res['halluc_nums']}, hC={res['halluc_cites']}) | {res['elapsed']}s\n"
+                f"| PPL={res['ppl']} | Fid={res['fidelity_pct']}% (hN={res['halluc_nums']}, hC={res['halluc_cites']}) "
+                f"| Burst={res['burstiness_score']} | {res['elapsed']}s\n"
             )
         if out_lines and not is_heading(out_lines[-1]):
             out_lines.append("")
